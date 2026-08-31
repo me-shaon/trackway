@@ -288,13 +288,14 @@ export async function initCommand(options: { hook?: boolean }, io: Io = consoleI
 
   io.out('');
   for (const target of hookTargets()) {
-    if (await isHookInstalled(target)) {
-      io.out(`Hook already installed for ${target.agent}.`);
-      continue;
-    }
-
+    // Always offered to the installer rather than skipped when one is present.
+    // The command carries the bounding, so an entry from an older version has
+    // to be replaced; checking only for presence meant a fix to the hook never
+    // reached anybody who had already run this.
     const result = await installHook(target, hookCommand());
-    if (result.status === 'installed') {
+    if (result.status === 'already-present') {
+      io.out(`Hook already installed for ${target.agent}, and up to date.`);
+    } else if (result.status === 'installed') {
       io.out(`Hook installed for ${target.agent} in ${target.settingsPath}`);
       io.out('This is once per machine and covers every repository.');
     } else if (result.status === 'failed') {

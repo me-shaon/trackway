@@ -1209,3 +1209,28 @@ describe('the command the agent hook runs', () => {
     expect(raw.match(/trackway sync/g)).toHaveLength(1);
   });
 });
+
+describe('running init again after an upgrade', () => {
+  // Checking only whether a hook was present meant a fix to the hook command
+  // never reached anybody who had already run init: the installer that knows
+  // how to replace an old entry was never called.
+  it('replaces a hook left by an older version', async () => {
+    const settingsPath = join(repo, 'home', '.claude', 'settings.json');
+    await mkdir(dirname(settingsPath), { recursive: true });
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'trackway sync --quiet &' }] }] },
+      }),
+      'utf8',
+    );
+
+    const target = { agent: 'claude-code', settingsPath };
+    expect(await isHookInstalled(target)).toBe(true);
+
+    const result = await installHook(target, hookCommand());
+
+    expect(result.status).toBe('installed');
+    expect(await readFile(settingsPath, 'utf8')).toContain('--if-due');
+  });
+});
