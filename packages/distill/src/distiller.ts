@@ -233,6 +233,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
     const records: MemoryRecord[] = [];
     const failures: unknown[] = [];
 
+    // How far an unbroken run of successful calls has reached. Chunks are
+    // ordered by offset, so once one fails nothing after it counts as covered
+    // however well it went: the next sweep must re-read from the gap.
+    let coveredTo: number | undefined;
+    let broken = false;
+
     for (const chunk of batch) {
       // Said before the call rather than after it. Each chunk is a model call
       // that takes the better part of a minute, and the wait is the part that
@@ -285,9 +291,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
         // One bad chunk must not cost the whole session. A long session is
         // exactly where losing everything hurts most.
         failures.push(lastError);
+        broken = true;
         report(
           `chunk ${chunk.index + 1} of ${chunk.total} gave up: ${describeFailure(lastError)}`,
         );
+      } else if (!broken) {
+        coveredTo = chunk.toOffset;
       }
     }
 
@@ -315,7 +324,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // Some chunks failed and others did not. Say so, so the sweep can keep
     // these records without treating the session as fully read.
     return failures.length > 0
-      ? markPartial(distilled, failures.length, failures.map(describeFailure))
+      ? markPartial(distilled, failures.length, failures.map(describeFailure), coveredTo)
       : distilled;
   };
 }

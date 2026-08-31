@@ -261,8 +261,40 @@ describe('the extraction prompt', () => {
   it('truncates a very long event rather than sending all of it', () => {
     const transcript = renderTranscript([eventAt(0, 'x'.repeat(50_000))]);
 
-    expect(transcript).toContain('(truncated)');
+    expect(transcript).toContain('characters omitted');
     expect(transcript.length).toBeLessThan(5_000);
+  });
+
+  /*
+   * One budget for every kind of event was wrong in both directions. Measured
+   * on a real 2687-event session, tool results were 80% of the request, 499k
+   * characters of command output, while the developer's own words were 2.8%.
+   */
+  it('spends far less of a request on tool output than on what people said', () => {
+    const long = 'y'.repeat(10_000);
+
+    const said = renderTranscript([{ ...eventAt(0, long), type: 'user_prompt' }]);
+    const printed = renderTranscript([{ ...eventAt(0, long), type: 'tool_result' }]);
+
+    expect(printed.length).toBeLessThan(said.length / 3);
+  });
+
+  // A command that failed says so at the end as often as at the beginning.
+  // Keeping only a prefix threw away the half that says whether it worked.
+  it('keeps both ends of a long tool result, not just the start', () => {
+    const output = `START${'-'.repeat(10_000)}FAILED: 3 tests`;
+
+    const transcript = renderTranscript([{ ...eventAt(0, output), type: 'tool_result' }]);
+
+    expect(transcript).toContain('START');
+    expect(transcript).toContain('FAILED: 3 tests');
+  });
+
+  it('leaves a short tool result exactly as it was', () => {
+    const transcript = renderTranscript([{ ...eventAt(0, 'ok, 12 passed'), type: 'tool_result' }]);
+
+    expect(transcript).toContain('ok, 12 passed');
+    expect(transcript).not.toContain('omitted');
   });
 
   it('describes an event with no text rather than emitting nothing', () => {

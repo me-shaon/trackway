@@ -23,6 +23,7 @@ import {
 import { isolate } from '@trackway/core';
 import { join } from 'node:path';
 import { acquireSyncLock } from './lock.js';
+import { recordSweep, sweepIsDue } from './schedule.js';
 import { openWorkspaceIndex, type Workspace } from './workspace.js';
 
 export interface SyncResult {
@@ -47,6 +48,11 @@ export interface SyncOptions {
   maxSessions?: number;
   now?: Date;
   onProgress?: (event: SweepProgress) => void;
+  /**
+   * Run only if the configured interval has passed. The hook sets this; a
+   * person typing `trackway sync` does not, because they asked for it now.
+   */
+  ifDue?: boolean;
 }
 
 function empty(): SyncResult {
@@ -74,6 +80,8 @@ const REENTRANT = 'already running inside a distillation; refusing to sweep recu
 
 const BUSY = 'another sync is already running for this repository';
 
+const TOO_SOON = 'swept recently; the hook waits for the configured interval';
+
 /**
  * Sweep, distil, write records, update the index.
  *
@@ -91,6 +99,15 @@ export async function sync(workspace: Workspace, options: SyncOptions = {}): Pro
   // One sweep per repository. The hook fires per session ending, and three
   // windows closing meant three sweeps racing over the same sessions, spending
   // the same model calls and contending on the same index.
+  // Checked before the lock, because being early is not contention and costs
+  // nothing to answer.
+  if (
+    options.ifDue &&
+    !sweepIsDue(workspace.cacheDir, workspace.config.minSyncIntervalMinutes, options.now)
+  ) {
+    return { ...empty(), halted: TOO_SOON };
+  }
+
   const lock = acquireSyncLock(workspace.cacheDir);
   if (!lock) return { ...empty(), halted: BUSY };
 
@@ -102,6 +119,11 @@ export async function sync(workspace: Workspace, options: SyncOptions = {}): Pro
       logPath: join(workspace.cacheDir, 'failures.log'),
       onFailure: (failure) => errors.push(failure.message),
     });
+
+    // Stamped whether or not it found anything, and whether or not it failed.
+    // A sweep that failed is exactly the one that must not be retried on the
+    // very next turn of the developer's session.
+    recordSweep(workspace.cacheDir, options.now);
 
     return { ...result, errors: [...result.errors, ...errors] };
   } finally {

@@ -93,15 +93,34 @@ export const PARTIAL = Symbol.for('trackway.partialDistillation');
 interface PartialMark {
   count: number;
   reasons: string[];
+  /**
+   * Highest offset covered by an unbroken run of successful calls.
+   *
+   * Without it, one failed call out of fifteen threw away the other fourteen:
+   * the watermark stayed where it was, so the next sweep re-read the whole
+   * session and paid for every chunk again. Measured on a 2687-event session,
+   * that was 93k input tokens re-spent to redo work already done, every sweep,
+   * until the session either succeeded outright or was given up on.
+   *
+   * Only an unbroken run counts. Chunks are ordered by offset, so if the third
+   * failed, nothing after it can be trusted as covered even though it
+   * succeeded, and re-reading from the third costs one pass and no duplicates.
+   */
+  coveredTo?: number;
 }
 
 export function markPartial(
   records: MemoryRecord[],
   failures: number,
   reasons: readonly string[] = [],
+  coveredTo?: number,
 ): MemoryRecord[] {
   return Object.defineProperty(records, PARTIAL, {
-    value: { count: failures, reasons: [...reasons] } satisfies PartialMark,
+    value: {
+      count: failures,
+      reasons: [...reasons],
+      ...(coveredTo === undefined ? {} : { coveredTo }),
+    } satisfies PartialMark,
     enumerable: false,
   }) as MemoryRecord[];
 }
@@ -124,6 +143,11 @@ export function partialFailures(records: MemoryRecord[] | null): number {
 /** Why the regions that failed failed, for reporting rather than for logic. */
 export function partialReasons(records: MemoryRecord[] | null): string[] {
   return partialMark(records)?.reasons ?? [];
+}
+
+/** How far an interrupted session got, so the next sweep resumes rather than restarts. */
+export function partialCoveredTo(records: MemoryRecord[] | null): number | undefined {
+  return partialMark(records)?.coveredTo;
 }
 
 /**
@@ -358,15 +382,17 @@ export async function runSweep(
       });
 
       if (unread > 0) {
-        // Keep what was read, and leave the watermark where it was so the part
-        // that failed is read again next time rather than skipped in silence.
-        recordFailure(
+        // Keep what was read, and resume from the last call that worked rather
+        // than from the beginning. Leaving the watermark alone meant one failed
+        // call out of fifteen cost the other fourteen again on every sweep.
+        recordPartial(
           state,
           key,
           descriptor,
           previous,
           now,
-          new Error(`${unread} of the session could not be read and will be retried`),
+          `${unread} of the session could not be read and will be retried`,
+          partialCoveredTo(records),
         );
       } else {
         recordSuccess(state, key, descriptor, highestOffset, now);
@@ -404,6 +430,36 @@ function recordSuccess(
     lastSweptAt: now.toISOString(),
     lastError: null,
     failureCount: 0,
+  };
+}
+
+/**
+ * Keeps the ground an interrupted session gained, and keeps it eligible.
+ *
+ * `lastSeenModified` deliberately stays at its old value. Eligibility skips a
+ * session whose file has not changed since a sweep that advanced the watermark,
+ * so writing the current mtime here would advance the watermark and then refuse
+ * to look at the session again, silently abandoning the part that failed.
+ */
+function recordPartial(
+  state: SweepState,
+  key: string,
+  descriptor: SessionDescriptor,
+  previous: SweepState['sessions'][string] | undefined,
+  now: Date,
+  reason: string,
+  coveredTo: number | undefined,
+): void {
+  const earned = Math.max(previous?.watermark ?? -1, coveredTo ?? -1);
+
+  state.sessions[key] = {
+    sessionId: descriptor.sessionId,
+    adapter: descriptor.adapter,
+    watermark: earned,
+    lastSeenModified: previous?.lastSeenModified ?? '',
+    lastSweptAt: now.toISOString(),
+    lastError: reason,
+    failureCount: (previous?.failureCount ?? 0) + 1,
   };
 }
 

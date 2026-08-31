@@ -51,17 +51,23 @@ export async function installHook(target: HookTarget, command: string): Promise<
   const hooks = (settings['hooks'] ?? {}) as Record<string, unknown>;
   const existing = Array.isArray(hooks['Stop']) ? (hooks['Stop'] as unknown[]) : [];
 
-  if (JSON.stringify(existing).includes(HOOK_MARKER)) {
-    return { agent: target.agent, settingsPath: target.settingsPath, status: 'already-present' };
-  }
-
   const entry = {
     hooks: [{ type: 'command', command, timeout: 5 }],
   };
 
+  // An entry from an older version runs an older command, and the command is
+  // where the bounding lives. Leaving it alone meant a fix to the hook never
+  // reached anybody who had already installed one.
+  const ours = (value: unknown): boolean => JSON.stringify(value).includes(HOOK_MARKER);
+  const mine = existing.filter(ours);
+
+  if (mine.length === 1 && JSON.stringify(mine[0]) === JSON.stringify(entry)) {
+    return { agent: target.agent, settingsPath: target.settingsPath, status: 'already-present' };
+  }
+
   const next = {
     ...settings,
-    hooks: { ...hooks, Stop: [...existing, entry] },
+    hooks: { ...hooks, Stop: [...existing.filter((value) => !ours(value)), entry] },
   };
 
   try {
@@ -87,9 +93,20 @@ export async function isHookInstalled(target: HookTarget): Promise<boolean> {
   }
 }
 
-/** The command the hook runs. Detached and silent, so it cannot block a session. */
+/**
+ * The command the hook runs.
+ *
+ * Detached and silent, so it cannot block a session. Bounded and interval-aware
+ * because it fires on every turn the agent finishes: sweeping the whole backlog
+ * each time meant the machine distilled continuously while the developer
+ * worked, and a session that failed was retried from the top on the next turn.
+ *
+ * `--if-due` leaves the interval to config, and `--max` keeps any one firing
+ * short. Clearing a large backlog is what running `trackway sync` by hand is
+ * for.
+ */
 export function hookCommand(): string {
-  return 'trackway sync --quiet &';
+  return 'trackway sync --quiet --if-due --max 3 &';
 }
 
 /**

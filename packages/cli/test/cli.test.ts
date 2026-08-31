@@ -29,6 +29,8 @@ import {
   acquireSyncLock,
   installGitHook,
   isGitHookInstalled,
+  recordSweep,
+  sweepIsDue,
   showCommand,
   whyCommand,
   writeConfig,
@@ -1101,5 +1103,109 @@ describe('syncing for agents that have no hook of their own', () => {
     // A hook that errors on every commit for someone who uninstalled trackway
     // is worse than no hook.
     expect(body).toContain('command -v trackway');
+  });
+});
+
+describe('not sweeping on every turn the agent finishes', () => {
+  /*
+   * The Stop hook fires each time the agent completes a turn, many times an
+   * hour. Sweeping on every one meant the machine distilled continuously while
+   * the developer worked, and a session that failed was retried from the top on
+   * the very next turn.
+   */
+  it('is due when nothing has swept yet', () => {
+    expect(sweepIsDue(join(repo, 'cache'), 10)).toBe(true);
+  });
+
+  it('is not due again straight away', () => {
+    const cacheDir = join(repo, 'cache');
+    const now = new Date('2026-08-31T12:00:00Z');
+
+    recordSweep(cacheDir, now);
+
+    expect(sweepIsDue(cacheDir, 10, new Date('2026-08-31T12:05:00Z'))).toBe(false);
+    expect(sweepIsDue(cacheDir, 10, new Date('2026-08-31T12:11:00Z'))).toBe(true);
+  });
+
+  // Someone typing `trackway sync` asked for it now.
+  it('is always due when the interval is switched off', () => {
+    const cacheDir = join(repo, 'cache');
+    recordSweep(cacheDir, new Date());
+
+    expect(sweepIsDue(cacheDir, 0)).toBe(true);
+  });
+
+  it('holds the interval back from a hook-triggered run', async () => {
+    const workspace = await loadWorkspace(repo);
+    recordSweep(workspace!.cacheDir, new Date());
+
+    const io = captureIo();
+    expect(await syncCommand({ ifDue: true }, io)).toBe(0);
+    expect(io.lines.join(' ')).toContain('swept recently');
+  });
+
+  it('lets a person run it whenever they like', async () => {
+    const workspace = await loadWorkspace(repo);
+    recordSweep(workspace!.cacheDir, new Date());
+
+    const io = captureIo();
+    await syncCommand({}, io);
+
+    expect(io.lines.join(' ')).not.toContain('swept recently');
+  });
+});
+
+describe('the command the agent hook runs', () => {
+  it('is bounded and interval-aware, not a full sweep every turn', () => {
+    expect(hookCommand()).toContain('--if-due');
+    expect(hookCommand()).toContain('--max');
+    expect(hookCommand()).toContain('--quiet');
+    expect(hookCommand().trimEnd().endsWith('&')).toBe(true);
+  });
+
+  // The command is where the bounding lives, so leaving an old entry alone
+  // meant a fix to the hook never reached anybody who already had one.
+  it('replaces an entry left by an older version', async () => {
+    const settingsPath = join(repo, 'settings.json');
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'trackway sync --quiet &' }] }] },
+      }),
+      'utf8',
+    );
+
+    const target = { agent: 'claude-code', settingsPath };
+    expect((await installHook(target, hookCommand())).status).toBe('installed');
+
+    const raw = await readFile(settingsPath, 'utf8');
+    expect(raw).toContain('--if-due');
+    expect(raw.match(/trackway sync/g)).toHaveLength(1);
+  });
+
+  it('leaves somebody else\'s Stop hook in place', async () => {
+    const settingsPath = join(repo, 'settings.json');
+    await writeFile(
+      settingsPath,
+      JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'say done' }] }] } }),
+      'utf8',
+    );
+
+    await installHook({ agent: 'claude-code', settingsPath }, hookCommand());
+
+    const raw = await readFile(settingsPath, 'utf8');
+    expect(raw).toContain('say done');
+    expect(raw).toContain('trackway sync');
+  });
+
+  it('does not keep adding itself', async () => {
+    const settingsPath = join(repo, 'settings.json');
+    const target = { agent: 'claude-code', settingsPath };
+
+    await installHook(target, hookCommand());
+    expect((await installHook(target, hookCommand())).status).toBe('already-present');
+
+    const raw = await readFile(settingsPath, 'utf8');
+    expect(raw.match(/trackway sync/g)).toHaveLength(1);
   });
 });

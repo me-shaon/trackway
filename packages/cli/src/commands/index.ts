@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { setPriority } from 'node:os';
 import { InvalidTranscriptError, defaultRegistry } from '@trackway/adapters';
 import {
   TrackwayConfig,
@@ -182,6 +183,22 @@ export function sweepReporter(io: Io, options: ProgressOptions = {}): SweepRepor
   };
 }
 
+/**
+ * Drops this process, and everything it spawns, below normal priority.
+ *
+ * A sweep is minutes of model subprocesses, each a few hundred megabytes. Run
+ * at normal priority from a hook that fires on every agent turn, it competes
+ * with the editor and the agent the developer is actually using. Failing to set
+ * it is not worth reporting: the sweep is still correct, just less polite.
+ */
+function yieldTheMachine(): void {
+  try {
+    setPriority(0, 10);
+  } catch {
+    // Not permitted on this platform or by this user. Carry on.
+  }
+}
+
 const NOT_A_REPO = 'Not inside a git repository. Trackway stores records per repository.';
 
 async function requireWorkspace(io: Io): Promise<Workspace | null> {
@@ -290,11 +307,16 @@ export async function initCommand(options: { hook?: boolean }, io: Io = consoleI
 }
 
 export async function syncCommand(
-  options: { quiet?: boolean; max?: number },
+  options: { quiet?: boolean; max?: number; ifDue?: boolean },
   io: Io = consoleIo,
 ): Promise<number> {
   const workspace = await requireWorkspace(io);
   if (!workspace) return 1;
+
+  // A hook-triggered sweep runs beside the developer's own work and must lose
+  // every contest for the machine. Children inherit this, so the agent
+  // subprocesses it spawns are niced too.
+  if (options.ifDue) yieldTheMachine();
 
   const startedAt = Date.now();
 
@@ -304,6 +326,7 @@ export async function syncCommand(
   // spinner ticking over the summary.
   const result = await sync(workspace, {
     ...(options.max === undefined ? {} : { maxSessions: options.max }),
+    ...(options.ifDue ? { ifDue: true } : {}),
     ...(reporter ? { onProgress: reporter.report } : {}),
   }).finally(() => reporter?.finish());
 

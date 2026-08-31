@@ -45,6 +45,7 @@ async function main(): Promise<void> {
     .description('distil sessions that have gone quiet')
     .option('-q, --quiet', 'print nothing on success')
     .option('--max <n>', 'stop after this many sessions', Number)
+    .option('--if-due', 'skip unless the configured interval has passed (used by the hook)')
     .action(async (options) => process.exit(await syncCommand(options, consoleIo)));
 
   program

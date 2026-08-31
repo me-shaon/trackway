@@ -1,6 +1,41 @@
 import type { MemoryEvent } from '@trackway/core';
 
-const MAX_TEXT_PER_EVENT = 1200;
+/**
+ * How much of each event reaches the model, by what kind of event it is.
+ *
+ * One budget for everything was wrong in both directions. Measured on a real
+ * 2687-event session: tool results were 80% of the request, 499k characters of
+ * command output and file dumps, while the developer's own words were 2.8%.
+ * Decisions are in what people said, not in what `ls` printed.
+ *
+ * Tool results are capped hard rather than dropped, because a failing test or
+ * an error message is exactly what an outcome record is made of. Their median
+ * length is 217 characters, so the cap costs nothing on a typical one and only
+ * bites on the tail: p99 is 11k and the largest seen was 46k.
+ */
+const TEXT_BUDGET: Record<MemoryEvent['type'], number> = {
+  // What the developer asked for. The single most valuable thing here.
+  user_prompt: 1600,
+  // Where the agent states what it is doing and why.
+  agent_message: 1400,
+  // The command matters; its output is a separate event.
+  tool_call: 500,
+  // Capped hardest. See above.
+  tool_result: 300,
+  file_change: 300,
+  error: 800,
+  session_start: 200,
+  session_end: 200,
+};
+
+/**
+ * Kept from both ends of an oversized value, not just the start.
+ *
+ * A command that failed says so at the end as often as at the beginning:
+ * stack traces, test summaries and non-zero exits all land in the tail. Keeping
+ * only a prefix threw away the half that says whether it worked.
+ */
+const TAIL_SHARE = 0.35;
 
 /**
  * The extraction prompt.
@@ -188,17 +223,22 @@ export function renderTranscript(events: readonly MemoryEvent[]): string {
   return events
     .map((event) => {
       const who = event.actor.type === 'human' ? 'DEVELOPER' : 'AGENT';
-      return `[${event.type} | ${who}]\n${summarizePayload(event.payload)}`;
+      return `[${event.type} | ${who}]\n${summarizePayload(event.payload, event.type)}`;
     })
     .join('\n\n');
 }
 
-function summarizePayload(payload: unknown): string {
+function summarizePayload(payload: unknown, type: MemoryEvent['type']): string {
   const text = collectText(payload).join('\n').trim();
   if (text.length === 0) return '(no text content)';
-  return text.length > MAX_TEXT_PER_EVENT
-    ? `${text.slice(0, MAX_TEXT_PER_EVENT)}\n… (truncated)`
-    : text;
+
+  const budget = TEXT_BUDGET[type] ?? 1200;
+  if (text.length <= budget) return text;
+
+  const tail = Math.floor(budget * TAIL_SHARE);
+  const head = budget - tail;
+
+  return `${text.slice(0, head)}\n… (${text.length - budget} characters omitted) …\n${text.slice(-tail)}`;
 }
 
 /** Pulls human-readable strings out of an adapter-shaped payload. */
