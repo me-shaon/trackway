@@ -30,6 +30,15 @@ export interface SweepOptions {
    * being counted as done with nothing written.
    */
   onSession?: (session: SweptSession) => Promise<void> | void;
+  /**
+   * Whether there is still budget to spend.
+   *
+   * Asked before each session rather than discovered inside one. Without it a
+   * spent budget still opened, read and reported on every remaining session,
+   * which is a pile of file reads and a confusing summary to reach the same
+   * answer: not this run.
+   */
+  hasBudget?: () => boolean;
 }
 
 /**
@@ -171,6 +180,28 @@ export function skippedReason(records: MemoryRecord[] | null): string | undefine
   return typeof value === 'string' ? value : undefined;
 }
 
+/**
+ * Marks a session that stopped early because the sweep ran out of budget.
+ *
+ * Distinct from a partial failure. Nothing went wrong, so nothing should be
+ * counted against the session, but the watermark must still advance only as far
+ * as the work that was done.
+ */
+export const INCOMPLETE = Symbol.for('trackway.incompleteSession');
+
+export function markIncomplete(records: MemoryRecord[], coveredTo: number | undefined): MemoryRecord[] {
+  return Object.defineProperty(records, INCOMPLETE, {
+    value: { coveredTo },
+    enumerable: false,
+  }) as MemoryRecord[];
+}
+
+export function incompleteCoveredTo(records: MemoryRecord[] | null): number | undefined | false {
+  const value = records === null ? undefined : (records as unknown as Record<symbol, unknown>)[INCOMPLETE];
+  if (value && typeof value === 'object') return (value as { coveredTo?: number }).coveredTo;
+  return false;
+}
+
 export interface SweptSession {
   sessionId: string;
   adapter: string;
@@ -184,6 +215,8 @@ export interface SweptSession {
   partialReasons?: string[];
   /** Set when the distiller declined to send this session, and why. */
   skipped?: string;
+  /** True when the sweep ran out of budget part way through this session. */
+  incomplete?: boolean;
 }
 
 export interface SweepFailure {
@@ -289,6 +322,13 @@ export async function runSweep(
     const index = position + 1;
     const where = { index, total, sessionId: descriptor.sessionId } as const;
 
+    if (options.hasBudget && !options.hasBudget()) {
+      // Everything from here is for the next run, and saying so is more honest
+      // than reporting each one as unfinished.
+      result.deferred += total - position;
+      break;
+    }
+
     report({ phase: 'reading', ...where, adapter: descriptor.adapter });
 
     try {
@@ -341,6 +381,27 @@ export async function runSweep(
         });
         report({ phase: 'done', ...where, records: 0, outcome: 'ingest-only' });
         recordSuccess(state, key, descriptor, highestOffset, now);
+        await checkpoint();
+        continue;
+      }
+
+      // Out of budget rather than in trouble: keep what was done, advance to
+      // it, and leave the session eligible so the next sweep carries on.
+      const stoppedAt = incompleteCoveredTo(records);
+      if (stoppedAt !== false) {
+        await keep({
+          sessionId: descriptor.sessionId,
+          adapter: descriptor.adapter,
+          records,
+          eventCount: events.length,
+          undistilled: false,
+          incomplete: true,
+        });
+        report({ phase: 'done', ...where, records: records.length, outcome: 'partial', reason: 'budget for this run is spent; will continue next time' });
+        recordPartial(state, key, descriptor, previous, now, 'stopped early: budget spent', stoppedAt);
+        // Not a failure, so it must not count towards giving up on the session.
+        const entry = state.sessions[key];
+        if (entry) entry.failureCount = previous?.failureCount ?? 0;
         await checkpoint();
         continue;
       }

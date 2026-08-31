@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { MemoryEvent } from '@trackway/core';
+import type { MemoryEvent, SessionDescriptor } from '@trackway/core';
 import {
   EXTRACTION_MARKER,
   RunnerError,
   buildPrompt,
   collectText,
+  createDistiller,
   createRunnerChain,
   defaultRunners,
   distillEnv,
@@ -277,5 +278,198 @@ describe('sizing a chunk by how big the request will be', () => {
     const { chunkEvents } = await import('../src/index.js');
 
     expect(chunkEvents(sized(Array(250).fill(10)), { chunkSize: 120 })).toHaveLength(3);
+  });
+});
+
+describe('what a sync spends', () => {
+  const descriptor: SessionDescriptor = {
+    sessionId: 'ses-1',
+    adapter: 'claude-code',
+    sessionFile: '/tmp/ses-1.jsonl',
+    cwd: '/repo',
+    branch: 'main',
+    lastModified: '2026-08-31T09:00:00Z',
+    formatVersion: 'claude-code/jsonl-v1',
+  };
+
+  const empty = JSON.stringify({ questions: [], discoveries: [], decisions: [], actions: [], outcomes: [] });
+
+  function chatty(n: number): MemoryEvent[] {
+    return Array.from({ length: n }, (_, i) =>
+      eventAt(i, i % 2 === 0 ? 'user_prompt' : 'agent_message', { content: 'x'.repeat(3000) }),
+    );
+  }
+
+  /*
+   * Thinking was 95% of what a call emitted: 5380 thinking tokens to produce
+   * 958 characters of JSON, and output is priced far above input. Judged by a
+   * stronger model on a real session, turning it off cost a third as much,
+   * found 8 sound decisions instead of 5, and moved precision 0.83 to 0.80.
+   */
+  it('asks the agent not to think, because extraction is transcription', async () => {
+    const { DISTILL_SETTINGS } = await import('../src/index.js');
+    expect(DISTILL_SETTINGS).toContain('alwaysThinkingEnabled');
+    expect(DISTILL_SETTINGS).toContain('false');
+  });
+
+  it('reports what each call consumed instead of discarding it', async () => {
+    const seen: number[] = [];
+    const runner: DistillRunner = {
+      id: 'stub',
+      isAvailable: async () => ({ available: true }),
+      run: async (_prompt, options) => {
+        options?.onUsage?.({ inputTokens: 100, cachedTokens: 10, outputTokens: 20, costUsd: 0.5 });
+        return empty;
+      },
+    };
+
+    await createDistiller({ runner, chunkSize: 10, onUsage: (u) => seen.push(u.costUsd) })({
+      descriptor,
+      events: chatty(20),
+      fromOffset: -1,
+    });
+
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((cost) => cost === 0.5)).toBe(true);
+  });
+
+  /*
+   * Bounding sessions let one firing of the hook spend forty-five calls on
+   * three long ones. Calls are the unit that costs money, so calls are what a
+   * background sweep is bounded by.
+   */
+  it('stops when the run is out of calls', async () => {
+    let calls = 0;
+    const runner: DistillRunner = {
+      id: 'stub',
+      isAvailable: async () => ({ available: true }),
+      run: async () => {
+        calls += 1;
+        return empty;
+      },
+    };
+
+    await createDistiller({ runner, chunkSize: 10, callBudget: { remaining: 2 } })({
+      descriptor,
+      events: chatty(100),
+      fromOffset: -1,
+    });
+
+    expect(calls).toBe(2);
+  });
+
+  // Running out is not a failure, so it must not count against the session.
+  it('records how far it got so the next run continues', async () => {
+    const { incompleteCoveredTo } = await import('../src/index.js');
+    const runner: DistillRunner = {
+      id: 'stub',
+      isAvailable: async () => ({ available: true }),
+      run: async () => empty,
+    };
+
+    const records = await createDistiller({ runner, chunkSize: 10, callBudget: { remaining: 2 } })({
+      descriptor,
+      events: chatty(100),
+      fromOffset: -1,
+    });
+
+    expect(incompleteCoveredTo(records)).toBe(19);
+  });
+
+  // Nobody decides anything in a stretch of pure tool traffic, and asking costs
+  // a call to be told so.
+  it('does not spend a call on a chunk that is only tool traffic', async () => {
+    let calls = 0;
+    const runner: DistillRunner = {
+      id: 'stub',
+      isAvailable: async () => ({ available: true }),
+      run: async () => {
+        calls += 1;
+        return empty;
+      },
+    };
+
+    const toolsOnly = Array.from({ length: 20 }, (_, i) =>
+      eventAt(i, i % 2 === 0 ? 'tool_call' : 'tool_result', { content: 'ls -la' }),
+    );
+
+    await createDistiller({ runner, chunkSize: 10 })({ descriptor, events: toolsOnly, fromOffset: -1 });
+
+    expect(calls).toBe(0);
+  });
+
+  it('still sends a chunk where somebody said something', async () => {
+    let calls = 0;
+    const runner: DistillRunner = {
+      id: 'stub',
+      isAvailable: async () => ({ available: true }),
+      run: async () => {
+        calls += 1;
+        return empty;
+      },
+    };
+
+    const mixed = [
+      eventAt(0, 'user_prompt', { content: 'Why is the cache cold?' }),
+      ...Array.from({ length: 9 }, (_, i) => eventAt(i + 1, 'tool_result', { content: 'ok' })),
+    ];
+
+    await createDistiller({ runner, chunkSize: 10 })({ descriptor, events: mixed, fromOffset: -1 });
+
+    expect(calls).toBe(1);
+  });
+});
+
+describe('stopping cleanly when the budget is gone', () => {
+  // A spent budget used to still open, read and report on every remaining
+  // session to reach the same answer: not this run.
+  it('does not even look at sessions it cannot afford', async () => {
+    const { AdapterRegistry } = await import('@trackway/adapters');
+    const { runSweep } = await import('../src/index.js');
+    const { mkdtemp } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+
+    const cacheDir = await mkdtemp(join(tmpdir(), 'trackway-budget-'));
+    const reads: string[] = [];
+
+    const describe1 = (id: string) => ({
+      sessionId: id,
+      adapter: 'fake',
+      sessionFile: `/tmp/${id}.jsonl`,
+      cwd: '/repo',
+      branch: 'main',
+      lastModified: '2026-08-31T09:00:00Z',
+      formatVersion: 'fake-v1',
+    });
+
+    const adapter = {
+      id: 'fake',
+      capabilities: { canDistill: true, suppliesRedaction: false, supportsHook: false },
+      isAvailable: async () => ({ available: true }),
+      listSessions: async () => [describe1('a'), describe1('b'), describe1('c')],
+      readSession: async (d: { sessionId: string }) => {
+        reads.push(d.sessionId);
+        return [eventAt(0, 'user_prompt', { content: 'hello' })];
+      },
+    };
+
+    let budget = 1;
+    const result = await runSweep(
+      new AdapterRegistry([adapter as never]),
+      async () => {
+        budget -= 1;
+        return [];
+      },
+      {
+        cacheDir,
+        quietWindowMinutes: 0,
+        now: new Date('2026-08-31T12:00:00Z'),
+        hasBudget: () => budget > 0,
+      },
+    );
+
+    expect(reads).toEqual(['a']);
+    expect(result.deferred).toBe(2);
   });
 });

@@ -33,7 +33,12 @@ import {
   isHookInstalled,
 } from '../hook.js';
 import { ingestTranscript, sync } from '../pipeline.js';
-import { createProgress, formatDuration, type ProgressOptions } from '../progress.js';
+import {
+  createProgress,
+  formatDuration,
+  formatTokens,
+  type ProgressOptions,
+} from '../progress.js';
 import {
   ensureIgnoreRules,
   loadWorkspace,
@@ -86,7 +91,12 @@ function describeOutcome(event: SweepProgress & { phase: 'done' }): string {
     case 'ingest-only':
       return 'read, but this agent cannot distil';
     case 'partial':
-      return `${event.records} record(s), part of it could not be read`;
+      // A run that stopped on budget and one that lost a region are both
+      // "finish this next time", but they are not the same news, so the reason
+      // is shown when there is one rather than assuming trouble.
+      return event.reason
+        ? `${event.records} record(s), ${truncate(event.reason, 70)}`
+        : `${event.records} record(s), part of it could not be read`;
     case 'failed':
       return `failed: ${truncate(event.reason ?? 'unknown', 80)}`;
     case 'skipped':
@@ -308,7 +318,7 @@ export async function initCommand(options: { hook?: boolean }, io: Io = consoleI
 }
 
 export async function syncCommand(
-  options: { quiet?: boolean; max?: number; ifDue?: boolean },
+  options: { quiet?: boolean; max?: number; ifDue?: boolean; maxCalls?: number },
   io: Io = consoleIo,
 ): Promise<number> {
   const workspace = await requireWorkspace(io);
@@ -327,6 +337,7 @@ export async function syncCommand(
   // spinner ticking over the summary.
   const result = await sync(workspace, {
     ...(options.max === undefined ? {} : { maxSessions: options.max }),
+    ...(options.maxCalls === undefined ? {} : { maxCalls: options.maxCalls }),
     ...(options.ifDue ? { ifDue: true } : {}),
     ...(reporter ? { onProgress: reporter.report } : {}),
   }).finally(() => reporter?.finish());
@@ -359,6 +370,16 @@ export async function syncCommand(
   }
   io.out(`  records:     ${result.written} new, ${result.skippedExisting} already present`);
 
+  // What it cost, every time. A tool that spends money in the background and
+  // never says how much is one people stop running.
+  if (result.calls > 0) {
+    const { spend } = result;
+    const cost = spend.costUsd > 0 ? `, $${spend.costUsd.toFixed(3)}` : '';
+    io.out(
+      `  spent:       ${result.calls} model call(s), ${formatTokens(spend.inputTokens)} in / ${formatTokens(spend.outputTokens)} out${cost}`,
+    );
+  }
+
   if (result.sweep.deferred > 0) {
     io.out(`  deferred:    ${result.sweep.deferred} (run again to continue)`);
   }
@@ -366,6 +387,13 @@ export async function syncCommand(
   // A session read in several calls can lose one of them after retries. The
   // records that did come back are kept, and the region that failed is read
   // again next sweep rather than skipped in silence.
+  const unfinished = result.sweep.swept.filter((session) => session.incomplete);
+  if (unfinished.length > 0) {
+    io.out(
+      `  unfinished:  ${unfinished.length} session(s) stopped when the call budget ran out; run again to continue`,
+    );
+  }
+
   const partial = result.sweep.swept.filter((session) => (session.partial ?? 0) > 0);
   if (partial.length > 0) {
     io.out(

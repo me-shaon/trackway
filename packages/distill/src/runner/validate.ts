@@ -27,18 +27,44 @@ const RawActor = z.strictObject({
  * not a recognisable actor string falls back to implicit, which is the honest
  * reading: no human acceptance was recorded.
  */
-const RawAcceptance = z.union([
-  RawActor,
-  z.string().transform((value) => {
-    const text = value.toLowerCase();
-    if (text.startsWith('human')) return { type: 'human' as const, id: value };
-    if (text.startsWith('agent')) return { type: 'agent' as const, id: value };
-    return 'implicit' as const;
-  }),
-]);
+const RawAcceptance = z
+  .union([
+    RawActor,
+    z.string().transform((value) => {
+      const text = value.toLowerCase();
+      if (text.startsWith('human')) return { type: 'human' as const, id: value };
+      if (text.startsWith('agent')) return { type: 'agent' as const, id: value };
+      return 'implicit' as const;
+    }),
+  ])
+  // Anything else at all, null included, reads as implicit for the same reason.
+  // Rejecting instead threw away every record in the batch and cost two more
+  // calls retrying, to be told the same thing: one malformed field on one
+  // decision was losing a whole chunk's work. Falling back can only ever
+  // understate a human acceptance, never invent one, which is the direction
+  // this file insists on everywhere else.
+  .catch('implicit' as const);
+
+/**
+ * The same tolerance for who proposed something, falling back the safe way.
+ *
+ * Unreadable means agent, never human. Crediting a person with proposing
+ * something they did not is the same class of error as recording an approval
+ * they never gave, and this file refuses that everywhere else.
+ */
+const RawProposer = z
+  .union([
+    RawActor,
+    z.string().transform((value) => {
+      const text = value.toLowerCase();
+      if (text.startsWith('human')) return { type: 'human' as const, id: value };
+      return { type: 'agent' as const, id: value };
+    }),
+  ])
+  .catch({ type: 'agent' as const, id: 'unknown' });
 
 const RawAttribution = z.strictObject({
-  proposedBy: RawActor,
+  proposedBy: RawProposer,
   acceptedBy: RawAcceptance,
 });
 

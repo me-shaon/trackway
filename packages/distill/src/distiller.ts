@@ -1,11 +1,11 @@
-import { withDerivedId, type MemoryRecord } from '@trackway/core';
+import { withDerivedId, type MemoryEvent, type MemoryRecord } from '@trackway/core';
 import { DEFAULT_CHUNK_SIZE, DEFAULT_MAX_CHUNK_CHARS, chunkEvents } from './chunk.js';
 import { describeForksForPrompt, forkAlternatives, harvestForks, type HarvestedFork } from './harvest.js';
 import { collapseNearDuplicates } from './dedupe.js';
 import { buildPrompt, isOwnExtraction, renderedSize } from './prompts/extract.js';
-import { RunnerError, type DistillRunner } from './runner/contract.js';
+import { RunnerError, type DistillRunner, type RunUsage } from './runner/contract.js';
 import { toRecords } from './runner/validate.js';
-import { markPartial, markSkipped, type Distiller } from './sweep/run.js';
+import { markIncomplete, markPartial, markSkipped, type Distiller } from './sweep/run.js';
 
 export interface DistillerOptions {
   runner: DistillRunner;
@@ -19,6 +19,17 @@ export interface DistillerOptions {
   retryDelayMs?: number;
   /** Ceiling on one request's rendered size. Events vary too much to bound by count. */
   maxChunkChars?: number;
+  /** Called with what each call consumed, so a sync can report what it spent. */
+  onUsage?: (usage: RunUsage) => void;
+  /**
+   * Model calls this sweep may still make, shared across every session in it.
+   *
+   * Cost is calls, so calls are what a background sweep has to be bounded by.
+   * Bounding sessions instead let one firing of the hook spend forty-five calls
+   * on three long sessions. Running out is not a failure: the session records
+   * how far it got and the next sweep continues from there.
+   */
+  callBudget?: { remaining: number };
   onProgress?: (message: string) => void;
 }
 
@@ -53,6 +64,30 @@ function isWorthRetrying(error: unknown): boolean {
 }
 
 const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Whether a chunk contains anything a record could be made of.
+ *
+ * Records come from what people said and what the agent said about it. A run of
+ * tool calls and their output carries neither: no question was asked, no choice
+ * was argued, nothing was concluded in words. Sending it costs a full call to
+ * be told there is nothing there.
+ *
+ * Deliberately generous. Any developer message at all counts, and so does any
+ * agent message with real prose in it, because the cost of keeping a chunk that
+ * turns out to be empty is one call, while the cost of dropping one that was
+ * not is a decision lost for good.
+ */
+const PROSE_ENOUGH_TO_MATTER = 200;
+
+export function couldHoldARecord(events: readonly MemoryEvent[]): boolean {
+  return events.some(
+    (event) =>
+      event.type === 'user_prompt' ||
+      (event.type === 'agent_message' && renderedSize(event) >= PROSE_ENOUGH_TO_MATTER) ||
+      event.type === 'error',
+  );
+}
 
 /** One line a person can act on, rather than a stack trace or `[object Object]`. */
 function describeFailure(error: unknown): string {
@@ -238,6 +273,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // however well it went: the next sweep must re-read from the gap.
     let coveredTo: number | undefined;
     let broken = false;
+    let outOfBudget = false;
 
     for (const chunk of batch) {
       // Said before the call rather than after it. Each chunk is a model call
@@ -256,12 +292,31 @@ export function createDistiller(options: DistillerOptions): Distiller {
         ...(inChunk.length > 0 ? { alreadyCaptured: describeForksForPrompt(inChunk) } : {}),
       });
 
+      if (options.callBudget && options.callBudget.remaining <= 0) {
+        report(`stopping at chunk ${chunk.index + 1} of ${chunk.total}: budget for this run is spent`);
+        outOfBudget = true;
+        break;
+      }
+
+      // Nobody decides anything in a stretch of pure tool traffic. A chunk with
+      // no developer message and no agent prose has nothing a record could be
+      // made of, and asking costs a call to be told so. Measured across one
+      // repository, 8% of chunks look like this.
+      if (!couldHoldARecord(chunk.events)) {
+        report(`chunk ${chunk.index + 1} of ${chunk.total} skipped: nothing but tool traffic`);
+        if (!broken) coveredTo = chunk.toOffset;
+        continue;
+      }
+
       const attempts = Math.max(1, options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
       let lastError: unknown;
 
       for (let attempt = 1; attempt <= attempts; attempt += 1) {
         try {
-          const output = await options.runner.run(prompt);
+          if (options.callBudget) options.callBudget.remaining -= 1;
+          const output = await options.runner.run(prompt, {
+            ...(options.onUsage ? { onUsage: options.onUsage } : {}),
+          });
 
           records.push(
             ...toRecords(output, {
@@ -323,8 +378,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
     // Some chunks failed and others did not. Say so, so the sweep can keep
     // these records without treating the session as fully read.
-    return failures.length > 0
-      ? markPartial(distilled, failures.length, failures.map(describeFailure), coveredTo)
-      : distilled;
+    if (failures.length > 0) {
+      return markPartial(distilled, failures.length, failures.map(describeFailure), coveredTo);
+    }
+
+    // Stopped on purpose rather than in trouble. The sweep advances the
+    // watermark to what was covered and leaves the rest for next time.
+    return outOfBudget ? markIncomplete(distilled, coveredTo) : distilled;
   };
 }

@@ -1164,3 +1164,46 @@ describe('explaining a long distillation while it runs', () => {
     expect(messages.join('\n')).toContain('gave up: claude-code: timed out');
   });
 });
+
+describe('surviving a malformed attribution', () => {
+  const decision = (acceptedBy: unknown) => ({
+    decisions: [
+      {
+        question: 'Which queue?',
+        choice: 'SQS',
+        reason: 'Already in the account.',
+        alternatives: [],
+        attribution: { proposedBy: { type: 'agent', id: 'agent:claude-code' }, acceptedBy },
+      },
+    ],
+  });
+
+  /*
+   * One malformed field on one decision used to lose every record in the batch
+   * and cost two more calls retrying, to be told the same thing. Falling back
+   * can only understate a human acceptance, never invent one.
+   */
+  it('reads null as implicit rather than losing the batch', () => {
+    const records = toRecords(JSON.stringify(decision(null)), provenance);
+
+    expect(records).toHaveLength(1);
+    expect(records[0]?.type === 'decision' && records[0].attribution.acceptedBy).toBe('implicit');
+  });
+
+  it('reads an unrecognisable object as implicit too', () => {
+    const records = toRecords(JSON.stringify(decision({ kind: 'nobody' })), provenance);
+
+    expect(records[0]?.type === 'decision' && records[0].attribution.acceptedBy).toBe('implicit');
+  });
+
+  it('still keeps a human acceptance that was properly recorded', () => {
+    const records = toRecords(
+      JSON.stringify(decision({ type: 'human', id: 'human:local' })),
+      provenance,
+    );
+
+    expect(records[0]?.type === 'decision' && records[0].attribution.acceptedBy).toMatchObject({
+      type: 'human',
+    });
+  });
+});

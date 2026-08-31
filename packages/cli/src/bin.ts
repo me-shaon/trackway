@@ -46,6 +46,7 @@ async function main(): Promise<void> {
     .option('-q, --quiet', 'print nothing on success')
     .option('--max <n>', 'stop after this many sessions', Number)
     .option('--if-due', 'skip unless the configured interval has passed (used by the hook)')
+    .option('--max-calls <n>', 'stop after this many model calls, resuming next run', Number)
     .action(async (options) => process.exit(await syncCommand(options, consoleIo)));
 
   program

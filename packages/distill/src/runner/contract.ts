@@ -46,7 +46,39 @@ export function distillEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.Process
   return { ...env, [DISTILL_ENV_MARKER]: '1' };
 }
 
+/**
+ * What one call consumed.
+ *
+ * Reported rather than inferred. A tool that spends the developer's money in
+ * the background and never says how much is a tool people stop trusting, and
+ * the agents already return this in their result envelope; Trackway was parsing
+ * that envelope and throwing the numbers away.
+ */
+export interface RunUsage {
+  inputTokens: number;
+  /** Tokens served from cache, which cost a fraction of fresh input. */
+  cachedTokens: number;
+  outputTokens: number;
+  /** What the agent said it cost, when it says. */
+  costUsd: number;
+}
+
+export function emptyUsage(): RunUsage {
+  return { inputTokens: 0, cachedTokens: 0, outputTokens: 0, costUsd: 0 };
+}
+
+export function addUsage(total: RunUsage, next: RunUsage): RunUsage {
+  return {
+    inputTokens: total.inputTokens + next.inputTokens,
+    cachedTokens: total.cachedTokens + next.cachedTokens,
+    outputTokens: total.outputTokens + next.outputTokens,
+    costUsd: total.costUsd + next.costUsd,
+  };
+}
+
 export interface RunOptions {
+  /** Called with what the call consumed, when the agent reports it. */
+  onUsage?: (usage: RunUsage) => void;
   /** Milliseconds before the process is killed. */
   timeoutMs?: number;
   signal?: AbortSignal;

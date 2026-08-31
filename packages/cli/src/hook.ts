@@ -101,12 +101,16 @@ export async function isHookInstalled(target: HookTarget): Promise<boolean> {
  * each time meant the machine distilled continuously while the developer
  * worked, and a session that failed was retried from the top on the next turn.
  *
- * `--if-due` leaves the interval to config, and `--max` keeps any one firing
- * short. Clearing a large backlog is what running `trackway sync` by hand is
- * for.
+ * `--if-due` leaves the interval to config. The bound is on model calls rather
+ * than on sessions, because calls are what cost money: three sessions sounds
+ * modest and can be forty-five calls if they are long ones. Running out is not
+ * a failure, so the session records how far it got and the next firing
+ * continues from there.
+ *
+ * Clearing a large backlog is what running `trackway sync` by hand is for.
  */
 export function hookCommand(): string {
-  return 'trackway sync --quiet --if-due --max 3 &';
+  return 'trackway sync --quiet --if-due --max-calls 6 &';
 }
 
 /**

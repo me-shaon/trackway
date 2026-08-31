@@ -11,10 +11,13 @@ import {
   type MemoryRecord,
 } from '@trackway/core';
 import {
+  addUsage,
   createDistiller,
   createRunnerChain,
   defaultRunners,
+  emptyUsage,
   insideDistillation,
+  type RunUsage,
   purgeCache,
   runSweep,
   type SweepProgress,
@@ -42,10 +45,16 @@ export interface SyncResult {
   errors: string[];
   /** Set when the sweep deliberately did not run. Not a failure. */
   halted?: string;
+  /** What the sweep spent. Reported, because a tool that quietly costs money loses trust. */
+  spend: RunUsage;
+  /** Model calls made. The unit cost actually scales with. */
+  calls: number;
 }
 
 export interface SyncOptions {
   maxSessions?: number;
+  /** Model calls this run may make. Cost scales with calls, so this is the real limit. */
+  maxCalls?: number;
   now?: Date;
   onProgress?: (event: SweepProgress) => void;
   /**
@@ -62,6 +71,8 @@ function empty(): SyncResult {
     skippedExisting: 0,
     purgedCacheFiles: 0,
     errors: [],
+    spend: emptyUsage(),
+    calls: 0,
   };
 }
 
@@ -133,7 +144,22 @@ export async function sync(workspace: Workspace, options: SyncOptions = {}): Pro
 
 async function runSync(workspace: Workspace, options: SyncOptions): Promise<SyncResult> {
   const registry = defaultRegistry();
-  const distill = createDistiller({ runner: createRunnerChain(defaultRunners()) });
+
+  let spend = emptyUsage();
+  let calls = 0;
+
+  // Shared across every session in this sweep, because the thing worth limiting
+  // is what the whole run costs, not what any one session costs.
+  const callBudget = options.maxCalls === undefined ? undefined : { remaining: options.maxCalls };
+
+  const distill = createDistiller({
+    runner: createRunnerChain(defaultRunners()),
+    onUsage: (usage) => {
+      spend = addUsage(spend, usage);
+      calls += 1;
+    },
+    ...(callBudget ? { callBudget } : {}),
+  });
 
   let written = 0;
   let skipped = 0;
@@ -145,6 +171,7 @@ async function runSync(workspace: Workspace, options: SyncOptions): Promise<Sync
     ...(options.maxSessions === undefined ? {} : { maxSessions: options.maxSessions }),
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+    ...(callBudget ? { hasBudget: () => callBudget.remaining > 0 } : {}),
 
     // One session at a time, as it finishes. Holding everything until the last
     // session meant a sweep that was interrupted after twenty minutes kept
@@ -173,7 +200,15 @@ async function runSync(workspace: Workspace, options: SyncOptions): Promise<Sync
     options.now ?? new Date(),
   ).catch(() => ({ purged: 0, kept: 0 }));
 
-  return { sweep, written, skippedExisting: skipped, purgedCacheFiles: purge.purged, errors: [] };
+  return {
+    sweep,
+    written,
+    skippedExisting: skipped,
+    purgedCacheFiles: purge.purged,
+    errors: [],
+    spend,
+    calls,
+  };
 }
 
 /**

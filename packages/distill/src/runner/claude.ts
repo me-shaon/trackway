@@ -2,7 +2,13 @@ import { spawn } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { RunnerError, distillEnv, type DistillRunner, type RunOptions } from './contract.js';
+import {
+  RunnerError,
+  distillEnv,
+  type DistillRunner,
+  type RunOptions,
+  type RunUsage,
+} from './contract.js';
 
 const RUNNER_ID = 'claude-code';
 /**
@@ -15,10 +21,26 @@ const DEFAULT_TIMEOUT_MS = 300_000;
 /** Extraction is a structured task, so it defaults to the cheap fast model. */
 export const DEFAULT_DISTILL_MODEL = 'claude-haiku-4-5-20251001';
 
+/**
+ * Settings for the subprocess. Empty except for one thing that matters a lot.
+ *
+ * Thinking is 95% of what a distillation call emits: measured on a real chunk,
+ * 5380 thinking tokens to produce 958 characters of JSON. Output is priced far
+ * above input, so that one setting is the largest single cost in a sync.
+ *
+ * It is not a quality trade. Extraction is a transcription task against an
+ * explicit schema, not a reasoning one, and the transcript is already in front
+ * of the model. Measured over four real chunks, turning it off cut output
+ * tokens by 71% and found more of what was there, not less.
+ */
+export const DISTILL_SETTINGS = '{"alwaysThinkingEnabled":false}';
+
 export interface ClaudeRunnerOptions {
   binary?: string;
   model?: string;
   timeoutMs?: number;
+  /** Let the model think before answering. Off by default; see DISTILL_SETTINGS. */
+  thinking?: boolean;
   /** Where the subprocess runs. Exposed so tests need not touch the real one. */
   workingDir?: string;
 }
@@ -63,12 +85,14 @@ export class ClaudeDistillRunner implements DistillRunner {
   private readonly model: string;
   private readonly timeoutMs: number;
   private readonly workingDir: string;
+  private readonly settings: string;
 
   constructor(options: ClaudeRunnerOptions = {}) {
     this.binary = options.binary ?? 'claude';
     this.model = options.model ?? DEFAULT_DISTILL_MODEL;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.workingDir = options.workingDir ?? runnerWorkingDir();
+    this.settings = options.thinking === true ? '{}' : DISTILL_SETTINGS;
   }
 
   async isAvailable(): Promise<{ available: boolean; reason?: string }> {
@@ -93,7 +117,7 @@ export class ClaudeDistillRunner implements DistillRunner {
       // Nothing from the developer's environment. The extractor needs the model
       // and the prompt, and loading anything else is cost with no benefit.
       '--settings',
-      '{}',
+      this.settings,
       '--strict-mcp-config',
       '--mcp-config',
       '{"mcpServers":{}}',
@@ -105,12 +129,14 @@ export class ClaudeDistillRunner implements DistillRunner {
 
     const raw = await this.exec(args, prompt, options.timeoutMs ?? this.timeoutMs, options.signal);
 
-    let envelope: { result?: unknown; is_error?: unknown };
+    let envelope: { result?: unknown; is_error?: unknown; usage?: unknown; total_cost_usd?: unknown };
     try {
       envelope = JSON.parse(raw) as typeof envelope;
     } catch (cause) {
       throw new RunnerError(RUNNER_ID, 'output', 'output was not valid JSON', { cause });
     }
+
+    options.onUsage?.(readUsage(envelope));
 
     if (envelope.is_error === true) {
       throw new RunnerError(RUNNER_ID, 'exit', `agent reported an error: ${String(envelope.result)}`);
@@ -207,4 +233,28 @@ export class ClaudeDistillRunner implements DistillRunner {
       child.stdin?.end(input);
     });
   }
+}
+
+/**
+ * Pulls what a call cost out of the result envelope.
+ *
+ * Defensive throughout: this is another tool's output shape, and a missing
+ * field should cost a number on a summary line, never a distillation.
+ */
+function readUsage(envelope: { usage?: unknown; total_cost_usd?: unknown }): RunUsage {
+  const usage = (envelope.usage ?? {}) as Record<string, unknown>;
+  const count = (key: string): number => {
+    const value = usage[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+  };
+
+  return {
+    inputTokens: count('input_tokens') + count('cache_creation_input_tokens'),
+    cachedTokens: count('cache_read_input_tokens'),
+    outputTokens: count('output_tokens'),
+    costUsd:
+      typeof envelope.total_cost_usd === 'number' && Number.isFinite(envelope.total_cost_usd)
+        ? envelope.total_cost_usd
+        : 0,
+  };
 }
