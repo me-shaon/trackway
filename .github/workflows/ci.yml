@@ -1,0 +1,64 @@
+name: CI
+
+# Every pull request, and anything that reaches main directly.
+#
+# The publish workflow already runs all of this before anything goes to the
+# registry, so this is not the last line of defence. It is the one that reports
+# before a merge instead of after a tag, which is the difference between a
+# contributor fixing their own branch and somebody discovering it at release.
+#
+# `pull_request` rather than `pull_request_target`: a fork's branch runs with a
+# read-only token and no secrets, which is the correct trade for a workflow
+# whose whole job is running code from that branch.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A branch pushed to twice does not need the first run finished.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the engines floor and what the publish workflow uses, so a
+          # pull request cannot pass here and fail there.
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+      - run: npm test
+
+      # Building the package is itself a check: it is where the workspace is
+      # bundled into the single binary that ships.
+      - run: npm run build:package
+
+      # Installs that tarball the way a user would and then uses it. Ten checks,
+      # including that the explorer's stylesheet and self-hosted fonts resolve in
+      # the published layout, which differs from the repository in exactly the
+      # way most likely to be wrong.
+      - run: npm run verify:package
+
+      # The explorer bundle is committed, so a change to its source that was
+      # never rebuilt would ship an explorer that does not match the code that
+      # was reviewed. `build:package` has already rebuilt it by this point, so a
+      # dirty tree here means the commit was missing the rebuild.
+      - name: The committed explorer matches its source
+        run: |
+          if ! git diff --quiet -- packages/ui/dist; then
+            echo "::error::packages/ui/dist is stale. Run 'npm run build' and commit the result."
+            git diff --stat -- packages/ui/dist
+            exit 1
+          fi
