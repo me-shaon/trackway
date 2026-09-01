@@ -1,6 +1,6 @@
 import { describeActor } from '../src/format.js';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -27,6 +27,11 @@ import {
   sessionsCommand,
   sweepReporter,
   syncCommand,
+  acquireSyncLock,
+  installGitHook,
+  isGitHookInstalled,
+  recordSweep,
+  sweepIsDue,
   showCommand,
   whyCommand,
   writeConfig,
@@ -951,5 +956,291 @@ describe('sync in a repository with no sessions of its own', () => {
 
     expect(await syncCommand({ quiet: true }, io)).toBe(0);
     expect([...io.lines, ...io.errors, ...io.statuses]).toEqual([]);
+  });
+});
+
+describe('one sweep at a time', () => {
+  /*
+   * The hook fires when a session ends, and a developer with three windows
+   * open ends three sessions. Without a lock each starts its own sweep over
+   * the same sessions, spending the same model calls three times.
+   */
+  it('lets one caller hold the lock and turns the next away', async () => {
+    const cacheDir = join(repo, 'cache');
+
+    const first = acquireSyncLock(cacheDir);
+    expect(first).not.toBeNull();
+    expect(acquireSyncLock(cacheDir)).toBeNull();
+
+    first?.release();
+    const third = acquireSyncLock(cacheDir);
+    expect(third).not.toBeNull();
+    third?.release();
+  });
+
+  // A sweep that crashed must not stop every future one.
+  it('takes over a lock whose owner is gone', async () => {
+    const cacheDir = join(repo, 'cache');
+    await mkdir(cacheDir, { recursive: true });
+
+    // A pid that cannot be running, written as though a dead sweep left it.
+    await writeFile(
+      join(cacheDir, 'sync.lock'),
+      JSON.stringify({ pid: 2147483, startedAt: new Date().toISOString() }),
+      'utf8',
+    );
+
+    const lock = acquireSyncLock(cacheDir);
+    expect(lock).not.toBeNull();
+    lock?.release();
+  });
+
+  it('does not take over a lock a live process holds', async () => {
+    const cacheDir = join(repo, 'cache');
+    await mkdir(cacheDir, { recursive: true });
+
+    // This very process is alive, so its lock is real however old it looks.
+    await writeFile(
+      join(cacheDir, 'sync.lock'),
+      JSON.stringify({ pid: process.pid, startedAt: new Date(Date.now() - 10 * 60_000).toISOString() }),
+      'utf8',
+    );
+
+    expect(acquireSyncLock(cacheDir)).toBeNull();
+  });
+});
+
+describe('a sync started from inside a distillation', () => {
+  /*
+   * The distill subprocess is an agent session, and ending one runs the
+   * developer's hooks, including the hook that starts a sweep. On a real
+   * machine this reached thirty-nine concurrent syncs in a few minutes.
+   */
+  it('refuses rather than recursing, and says so plainly', async () => {
+    const io = captureIo();
+    const previous = process.env.TRACKWAY_DISTILLING;
+    process.env.TRACKWAY_DISTILLING = '1';
+
+    try {
+      expect(await syncCommand({}, io)).toBe(0);
+      expect(io.lines.join(' ')).toContain('refusing to sweep recursively');
+    } finally {
+      if (previous === undefined) delete process.env.TRACKWAY_DISTILLING;
+      else process.env.TRACKWAY_DISTILLING = previous;
+    }
+  });
+
+  it('still prints nothing when quiet, which is how the hook runs it', async () => {
+    const io = captureIo();
+    const previous = process.env.TRACKWAY_DISTILLING;
+    process.env.TRACKWAY_DISTILLING = '1';
+
+    try {
+      expect(await syncCommand({ quiet: true }, io)).toBe(0);
+      expect([...io.lines, ...io.errors, ...io.statuses]).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.TRACKWAY_DISTILLING;
+      else process.env.TRACKWAY_DISTILLING = previous;
+    }
+  });
+});
+
+describe('syncing for agents that have no hook of their own', () => {
+  /*
+   * Claude Code is the only agent exposing a lifecycle hook. A repository
+   * worked on entirely through Codex or OpenCode never synced by itself. A
+   * commit is the agent-agnostic signal, and it is already the moment records
+   * are linked to.
+   */
+  it('installs a post-commit hook where git actually looks for one', async () => {
+    const result = await installGitHook(repo);
+
+    expect(result.status).toBe('installed');
+    expect(await isGitHookInstalled(repo)).toBe(true);
+
+    const body = await readFile(join(repo, '.git', 'hooks', 'post-commit'), 'utf8');
+    expect(body).toContain('trackway sync --quiet');
+    expect(body.startsWith('#!')).toBe(true);
+  });
+
+  it('makes it executable, or git ignores it', async () => {
+    await installGitHook(repo);
+    const { mode } = await stat(join(repo, '.git', 'hooks', 'post-commit'));
+
+    expect(mode & 0o111).not.toBe(0);
+  });
+
+  // A repository with a post-commit hook has it for a reason. Replacing it
+  // would be the worst thing this could do.
+  it('keeps a hook that is already there', async () => {
+    const path = join(repo, '.git', 'hooks', 'post-commit');
+    await writeFile(path, '#!/bin/sh\necho "existing hook"\n', { mode: 0o755 });
+
+    const result = await installGitHook(repo);
+
+    expect(result.status).toBe('appended');
+    const body = await readFile(path, 'utf8');
+    expect(body).toContain('echo "existing hook"');
+    expect(body).toContain('trackway sync --quiet');
+  });
+
+  it('does not install itself twice', async () => {
+    await installGitHook(repo);
+    expect((await installGitHook(repo)).status).toBe('already-present');
+
+    const body = await readFile(join(repo, '.git', 'hooks', 'post-commit'), 'utf8');
+    expect(body.match(/trackway sync --quiet/g)).toHaveLength(1);
+  });
+
+  // Asked of git rather than assumed: a worktree puts hooks elsewhere, and a
+  // repository using husky sets core.hooksPath. Writing to the wrong place
+  // installs a hook that never runs and reports success.
+  it('follows core.hooksPath rather than assuming .git/hooks', async () => {
+    const custom = join(repo, '.husky');
+    await mkdir(custom, { recursive: true });
+    await run('git', ['config', 'core.hooksPath', '.husky'], { cwd: repo });
+
+    const result = await installGitHook(repo);
+
+    expect(result.path).toContain('.husky');
+    expect(await readFile(join(custom, 'post-commit'), 'utf8')).toContain('trackway sync --quiet');
+  });
+
+  it('does not run trackway when it is not on the path', async () => {
+    await installGitHook(repo);
+    const body = await readFile(join(repo, '.git', 'hooks', 'post-commit'), 'utf8');
+
+    // A hook that errors on every commit for someone who uninstalled trackway
+    // is worse than no hook.
+    expect(body).toContain('command -v trackway');
+  });
+});
+
+describe('not sweeping on every turn the agent finishes', () => {
+  /*
+   * The Stop hook fires each time the agent completes a turn, many times an
+   * hour. Sweeping on every one meant the machine distilled continuously while
+   * the developer worked, and a session that failed was retried from the top on
+   * the very next turn.
+   */
+  it('is due when nothing has swept yet', () => {
+    expect(sweepIsDue(join(repo, 'cache'), 10)).toBe(true);
+  });
+
+  it('is not due again straight away', () => {
+    const cacheDir = join(repo, 'cache');
+    const now = new Date('2026-08-31T12:00:00Z');
+
+    recordSweep(cacheDir, now);
+
+    expect(sweepIsDue(cacheDir, 10, new Date('2026-08-31T12:05:00Z'))).toBe(false);
+    expect(sweepIsDue(cacheDir, 10, new Date('2026-08-31T12:11:00Z'))).toBe(true);
+  });
+
+  // Someone typing `trackway sync` asked for it now.
+  it('is always due when the interval is switched off', () => {
+    const cacheDir = join(repo, 'cache');
+    recordSweep(cacheDir, new Date());
+
+    expect(sweepIsDue(cacheDir, 0)).toBe(true);
+  });
+
+  it('holds the interval back from a hook-triggered run', async () => {
+    const workspace = await loadWorkspace(repo);
+    recordSweep(workspace!.cacheDir, new Date());
+
+    const io = captureIo();
+    expect(await syncCommand({ ifDue: true }, io)).toBe(0);
+    expect(io.lines.join(' ')).toContain('swept recently');
+  });
+
+  it('lets a person run it whenever they like', async () => {
+    const workspace = await loadWorkspace(repo);
+    recordSweep(workspace!.cacheDir, new Date());
+
+    const io = captureIo();
+    await syncCommand({}, io);
+
+    expect(io.lines.join(' ')).not.toContain('swept recently');
+  });
+});
+
+describe('the command the agent hook runs', () => {
+  it('is bounded and interval-aware, not a full sweep every turn', () => {
+    expect(hookCommand()).toContain('--if-due');
+    expect(hookCommand()).toContain('--max');
+    expect(hookCommand()).toContain('--quiet');
+    expect(hookCommand().trimEnd().endsWith('&')).toBe(true);
+  });
+
+  // The command is where the bounding lives, so leaving an old entry alone
+  // meant a fix to the hook never reached anybody who already had one.
+  it('replaces an entry left by an older version', async () => {
+    const settingsPath = join(repo, 'settings.json');
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'trackway sync --quiet &' }] }] },
+      }),
+      'utf8',
+    );
+
+    const target = { agent: 'claude-code', settingsPath };
+    expect((await installHook(target, hookCommand())).status).toBe('installed');
+
+    const raw = await readFile(settingsPath, 'utf8');
+    expect(raw).toContain('--if-due');
+    expect(raw.match(/trackway sync/g)).toHaveLength(1);
+  });
+
+  it('leaves somebody else\'s Stop hook in place', async () => {
+    const settingsPath = join(repo, 'settings.json');
+    await writeFile(
+      settingsPath,
+      JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'say done' }] }] } }),
+      'utf8',
+    );
+
+    await installHook({ agent: 'claude-code', settingsPath }, hookCommand());
+
+    const raw = await readFile(settingsPath, 'utf8');
+    expect(raw).toContain('say done');
+    expect(raw).toContain('trackway sync');
+  });
+
+  it('does not keep adding itself', async () => {
+    const settingsPath = join(repo, 'settings.json');
+    const target = { agent: 'claude-code', settingsPath };
+
+    await installHook(target, hookCommand());
+    expect((await installHook(target, hookCommand())).status).toBe('already-present');
+
+    const raw = await readFile(settingsPath, 'utf8');
+    expect(raw.match(/trackway sync/g)).toHaveLength(1);
+  });
+});
+
+describe('running init again after an upgrade', () => {
+  // Checking only whether a hook was present meant a fix to the hook command
+  // never reached anybody who had already run init: the installer that knows
+  // how to replace an old entry was never called.
+  it('replaces a hook left by an older version', async () => {
+    const settingsPath = join(repo, 'home', '.claude', 'settings.json');
+    await mkdir(dirname(settingsPath), { recursive: true });
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'trackway sync --quiet &' }] }] },
+      }),
+      'utf8',
+    );
+
+    const target = { agent: 'claude-code', settingsPath };
+    expect(await isHookInstalled(target)).toBe(true);
+
+    const result = await installHook(target, hookCommand());
+
+    expect(result.status).toBe('installed');
+    expect(await readFile(settingsPath, 'utf8')).toContain('--if-due');
   });
 });

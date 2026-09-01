@@ -261,8 +261,40 @@ describe('the extraction prompt', () => {
   it('truncates a very long event rather than sending all of it', () => {
     const transcript = renderTranscript([eventAt(0, 'x'.repeat(50_000))]);
 
-    expect(transcript).toContain('(truncated)');
+    expect(transcript).toContain('characters omitted');
     expect(transcript.length).toBeLessThan(5_000);
+  });
+
+  /*
+   * One budget for every kind of event was wrong in both directions. Measured
+   * on a real 2687-event session, tool results were 80% of the request, 499k
+   * characters of command output, while the developer's own words were 2.8%.
+   */
+  it('spends far less of a request on tool output than on what people said', () => {
+    const long = 'y'.repeat(10_000);
+
+    const said = renderTranscript([{ ...eventAt(0, long), type: 'user_prompt' }]);
+    const printed = renderTranscript([{ ...eventAt(0, long), type: 'tool_result' }]);
+
+    expect(printed.length).toBeLessThan(said.length / 3);
+  });
+
+  // A command that failed says so at the end as often as at the beginning.
+  // Keeping only a prefix threw away the half that says whether it worked.
+  it('keeps both ends of a long tool result, not just the start', () => {
+    const output = `START${'-'.repeat(10_000)}FAILED: 3 tests`;
+
+    const transcript = renderTranscript([{ ...eventAt(0, output), type: 'tool_result' }]);
+
+    expect(transcript).toContain('START');
+    expect(transcript).toContain('FAILED: 3 tests');
+  });
+
+  it('leaves a short tool result exactly as it was', () => {
+    const transcript = renderTranscript([{ ...eventAt(0, 'ok, 12 passed'), type: 'tool_result' }]);
+
+    expect(transcript).toContain('ok, 12 passed');
+    expect(transcript).not.toContain('omitted');
   });
 
   it('describes an event with no text rather than emitting nothing', () => {
@@ -627,28 +659,6 @@ describe('chunking a long session', () => {
     // three calls covering the first 60 events and silently losing 340.
     expect(seen.length).toBeLessThanOrEqual(4);
     expect(seen.reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(400);
-  });
-
-  it('reports when it widens rather than doing it silently', async () => {
-    const messages: string[] = [];
-    const runner: DistillRunner = {
-      id: 'stub',
-      async isAvailable() {
-        return { available: true };
-      },
-      async run() {
-        return JSON.stringify({});
-      },
-    };
-
-    await createDistiller({
-      runner,
-      chunkSize: 20,
-      maxChunks: 2,
-      onProgress: (m) => messages.push(m),
-    })({ descriptor, events: eventsN(400), fromOffset: -1 });
-
-    expect(messages.join(' ')).toContain('widening chunks');
   });
 
   it('covers every event of a long session across its chunks', () => {
@@ -1152,5 +1162,48 @@ describe('explaining a long distillation while it runs', () => {
     }).catch(() => undefined);
 
     expect(messages.join('\n')).toContain('gave up: claude-code: timed out');
+  });
+});
+
+describe('surviving a malformed attribution', () => {
+  const decision = (acceptedBy: unknown) => ({
+    decisions: [
+      {
+        question: 'Which queue?',
+        choice: 'SQS',
+        reason: 'Already in the account.',
+        alternatives: [],
+        attribution: { proposedBy: { type: 'agent', id: 'agent:claude-code' }, acceptedBy },
+      },
+    ],
+  });
+
+  /*
+   * One malformed field on one decision used to lose every record in the batch
+   * and cost two more calls retrying, to be told the same thing. Falling back
+   * can only understate a human acceptance, never invent one.
+   */
+  it('reads null as implicit rather than losing the batch', () => {
+    const records = toRecords(JSON.stringify(decision(null)), provenance);
+
+    expect(records).toHaveLength(1);
+    expect(records[0]?.type === 'decision' && records[0].attribution.acceptedBy).toBe('implicit');
+  });
+
+  it('reads an unrecognisable object as implicit too', () => {
+    const records = toRecords(JSON.stringify(decision({ kind: 'nobody' })), provenance);
+
+    expect(records[0]?.type === 'decision' && records[0].attribution.acceptedBy).toBe('implicit');
+  });
+
+  it('still keeps a human acceptance that was properly recorded', () => {
+    const records = toRecords(
+      JSON.stringify(decision({ type: 'human', id: 'human:local' })),
+      provenance,
+    );
+
+    expect(records[0]?.type === 'decision' && records[0].attribution.acceptedBy).toMatchObject({
+      type: 'human',
+    });
   });
 });

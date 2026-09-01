@@ -31,7 +31,7 @@ async function main(): Promise<void> {
   program
     .name('trackway')
     .description('Answers why a line of code exists, using the agent session behind it.')
-    .version('0.3.0')
+    .version('0.6.0')
     .showHelpAfterError();
 
   program
@@ -45,6 +45,8 @@ async function main(): Promise<void> {
     .description('distil sessions that have gone quiet')
     .option('-q, --quiet', 'print nothing on success')
     .option('--max <n>', 'stop after this many sessions', Number)
+    .option('--if-due', 'skip unless the configured interval has passed (used by the hook)')
+    .option('--max-calls <n>', 'stop after this many model calls, resuming next run', Number)
     .action(async (options) => process.exit(await syncCommand(options, consoleIo)));
 
   program

@@ -27,6 +27,11 @@ export async function triageDiscoveries(
   const discoveries = records.filter((record) => record.type === 'discovery');
   if (discoveries.length === 0) return [...records];
 
+  // Nothing to demote. The extraction pass already marks a good share of
+  // discoveries as working, and asking about a batch where every one is already
+  // hidden costs a call to be told what we can see for ourselves.
+  if (discoveries.every((record) => record.significance === 'working')) return [...records];
+
   let verdict: unknown;
   try {
     verdict = extractJsonObject(await runner.run(buildTriagePrompt(discoveries)));

@@ -801,3 +801,101 @@ describe('keeping what a long sweep has already earned', () => {
     expect(result.swept.map((session) => session.sessionId)).toEqual(['ses-1']);
   });
 });
+
+describe('resuming a session that was interrupted part way', () => {
+  /*
+   * One failed call out of fifteen used to cost the other fourteen again. The
+   * watermark stayed put, so the next sweep re-read the whole session and paid
+   * for every chunk. Measured on a 2687-event session: 93k input tokens
+   * re-spent to redo work already done, on every sweep.
+   */
+  function oneSession() {
+    const events = new Map([['ses-1', [eventAt(0, 'ses-1'), eventAt(1, 'ses-1'), eventAt(2, 'ses-1')]]]);
+    return new AdapterRegistry([new FakeAdapter('fake', [descriptor()], events)]);
+  }
+
+  it('keeps the ground the successful calls gained', async () => {
+    await runSweep(
+      oneSession(),
+      async () => markPartial([recordFor('ses-1', 'kept')], 1, ['timed out'], 1),
+      { cacheDir, quietWindowMinutes: 15, now: NOW },
+    );
+
+    const state = await loadState(cacheDir);
+    expect(state.sessions[stateKey('fake', 'ses-1')]?.watermark).toBe(1);
+  });
+
+  // Eligibility skips a session whose file has not changed since a sweep that
+  // advanced the watermark. Recording the current mtime here would advance the
+  // watermark and then refuse to look again, abandoning the part that failed.
+  it('stays eligible, so the part that failed is actually retried', async () => {
+    const registry = oneSession();
+
+    await runSweep(
+      registry,
+      async () => markPartial([recordFor('ses-1', 'kept')], 1, ['timed out'], 1),
+      { cacheDir, quietWindowMinutes: 15, now: NOW },
+    );
+
+    const state = await loadState(cacheDir);
+    const assessment = assessEligibility(descriptor(), state, {
+      quietWindowMinutes: 15,
+      now: NOW,
+    });
+
+    expect(assessment.eligible).toBe(true);
+  });
+
+  it('reads only what is left the next time round', async () => {
+    const registry = oneSession();
+    const adapter = registry.all()[0] as unknown as { readSessionCalls: Array<{ fromOffset: number | undefined }> };
+
+    const partial: Distiller = async () => markPartial([recordFor('ses-1', 'kept')], 1, ['timed out'], 1);
+
+    await runSweep(registry, partial, { cacheDir, quietWindowMinutes: 15, now: NOW });
+    await runSweep(registry, partial, { cacheDir, quietWindowMinutes: 15, now: NOW });
+
+    expect(adapter.readSessionCalls.map((call) => call.fromOffset)).toEqual([-1, 1]);
+  });
+
+  // Chunks are ordered by offset, so once one fails nothing after it counts as
+  // covered however well it went.
+  it('does not credit progress past the first failure', async () => {
+    await runSweep(
+      oneSession(),
+      async () => markPartial([recordFor('ses-1', 'kept')], 1, ['timed out']),
+      { cacheDir, quietWindowMinutes: 15, now: NOW },
+    );
+
+    const state = await loadState(cacheDir);
+    expect(state.sessions[stateKey('fake', 'ses-1')]?.watermark).toBe(-1);
+  });
+
+  it('never moves the watermark backwards', async () => {
+    const registry = oneSession();
+
+    await saveState(cacheDir, {
+      version: 1,
+      sessions: {
+        [stateKey('fake', 'ses-1')]: {
+          sessionId: 'ses-1',
+          adapter: 'fake',
+          watermark: 2,
+          lastSeenModified: 'old',
+          lastSweptAt: NOW.toISOString(),
+          lastError: null,
+          failureCount: 0,
+        },
+      },
+    });
+
+    await runSweep(
+      registry,
+      async () => markPartial([recordFor('ses-1', 'kept')], 1, ['timed out'], 0),
+      { cacheDir, quietWindowMinutes: 15, now: NOW },
+    );
+
+    const state = await loadState(cacheDir);
+    expect(state.sessions[stateKey('fake', 'ses-1')]?.watermark).toBe(2);
+  });
+});

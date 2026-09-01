@@ -53,6 +53,11 @@ export function formatDuration(ms: number): string {
   return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s`;
 }
 
+/** Token counts at the magnitude people quote them in. */
+export function formatTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
+}
+
 function bar(completed: number, total: number, width: number): string {
   const fraction = total > 0 ? Math.min(1, Math.max(0, completed / total)) : 0;
   const filled = Math.round(fraction * width);

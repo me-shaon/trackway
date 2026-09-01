@@ -30,6 +30,15 @@ export interface SweepOptions {
    * being counted as done with nothing written.
    */
   onSession?: (session: SweptSession) => Promise<void> | void;
+  /**
+   * Whether there is still budget to spend.
+   *
+   * Asked before each session rather than discovered inside one. Without it a
+   * spent budget still opened, read and reported on every remaining session,
+   * which is a pile of file reads and a confusing summary to reach the same
+   * answer: not this run.
+   */
+  hasBudget?: () => boolean;
 }
 
 /**
@@ -55,7 +64,7 @@ export type SweepProgress =
       total: number;
       sessionId: string;
       records: number;
-      outcome: 'distilled' | 'ingest-only' | 'partial' | 'failed';
+      outcome: 'distilled' | 'ingest-only' | 'partial' | 'failed' | 'skipped';
       reason?: string;
     };
 
@@ -93,15 +102,34 @@ export const PARTIAL = Symbol.for('trackway.partialDistillation');
 interface PartialMark {
   count: number;
   reasons: string[];
+  /**
+   * Highest offset covered by an unbroken run of successful calls.
+   *
+   * Without it, one failed call out of fifteen threw away the other fourteen:
+   * the watermark stayed where it was, so the next sweep re-read the whole
+   * session and paid for every chunk again. Measured on a 2687-event session,
+   * that was 93k input tokens re-spent to redo work already done, every sweep,
+   * until the session either succeeded outright or was given up on.
+   *
+   * Only an unbroken run counts. Chunks are ordered by offset, so if the third
+   * failed, nothing after it can be trusted as covered even though it
+   * succeeded, and re-reading from the third costs one pass and no duplicates.
+   */
+  coveredTo?: number;
 }
 
 export function markPartial(
   records: MemoryRecord[],
   failures: number,
   reasons: readonly string[] = [],
+  coveredTo?: number,
 ): MemoryRecord[] {
   return Object.defineProperty(records, PARTIAL, {
-    value: { count: failures, reasons: [...reasons] } satisfies PartialMark,
+    value: {
+      count: failures,
+      reasons: [...reasons],
+      ...(coveredTo === undefined ? {} : { coveredTo }),
+    } satisfies PartialMark,
     enumerable: false,
   }) as MemoryRecord[];
 }
@@ -126,6 +154,54 @@ export function partialReasons(records: MemoryRecord[] | null): string[] {
   return partialMark(records)?.reasons ?? [];
 }
 
+/** How far an interrupted session got, so the next sweep resumes rather than restarts. */
+export function partialCoveredTo(records: MemoryRecord[] | null): number | undefined {
+  return partialMark(records)?.coveredTo;
+}
+
+/**
+ * Marks records from a session the distiller deliberately declined to send.
+ *
+ * Distinct from an adapter that cannot distil, which is what returning null
+ * means. Reporting a skip as "this agent cannot distil" told the reader the
+ * wrong thing about 143 of 151 sessions.
+ */
+export const SKIPPED = Symbol.for('trackway.skippedSession');
+
+export function markSkipped(reason: string): MemoryRecord[] {
+  return Object.defineProperty([] as MemoryRecord[], SKIPPED, {
+    value: reason,
+    enumerable: false,
+  }) as MemoryRecord[];
+}
+
+export function skippedReason(records: MemoryRecord[] | null): string | undefined {
+  const value = records === null ? undefined : (records as unknown as Record<symbol, unknown>)[SKIPPED];
+  return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Marks a session that stopped early because the sweep ran out of budget.
+ *
+ * Distinct from a partial failure. Nothing went wrong, so nothing should be
+ * counted against the session, but the watermark must still advance only as far
+ * as the work that was done.
+ */
+export const INCOMPLETE = Symbol.for('trackway.incompleteSession');
+
+export function markIncomplete(records: MemoryRecord[], coveredTo: number | undefined): MemoryRecord[] {
+  return Object.defineProperty(records, INCOMPLETE, {
+    value: { coveredTo },
+    enumerable: false,
+  }) as MemoryRecord[];
+}
+
+export function incompleteCoveredTo(records: MemoryRecord[] | null): number | undefined | false {
+  const value = records === null ? undefined : (records as unknown as Record<symbol, unknown>)[INCOMPLETE];
+  if (value && typeof value === 'object') return (value as { coveredTo?: number }).coveredTo;
+  return false;
+}
+
 export interface SweptSession {
   sessionId: string;
   adapter: string;
@@ -137,6 +213,10 @@ export interface SweptSession {
   partial?: number;
   /** Why those regions failed. A count alone cannot be acted on. */
   partialReasons?: string[];
+  /** Set when the distiller declined to send this session, and why. */
+  skipped?: string;
+  /** True when the sweep ran out of budget part way through this session. */
+  incomplete?: boolean;
 }
 
 export interface SweepFailure {
@@ -242,6 +322,13 @@ export async function runSweep(
     const index = position + 1;
     const where = { index, total, sessionId: descriptor.sessionId } as const;
 
+    if (options.hasBudget && !options.hasBudget()) {
+      // Everything from here is for the next run, and saying so is more honest
+      // than reporting each one as unfinished.
+      result.deferred += total - position;
+      break;
+    }
+
     report({ phase: 'reading', ...where, adapter: descriptor.adapter });
 
     try {
@@ -298,6 +385,43 @@ export async function runSweep(
         continue;
       }
 
+      // Out of budget rather than in trouble: keep what was done, advance to
+      // it, and leave the session eligible so the next sweep carries on.
+      const stoppedAt = incompleteCoveredTo(records);
+      if (stoppedAt !== false) {
+        await keep({
+          sessionId: descriptor.sessionId,
+          adapter: descriptor.adapter,
+          records,
+          eventCount: events.length,
+          undistilled: false,
+          incomplete: true,
+        });
+        report({ phase: 'done', ...where, records: records.length, outcome: 'partial', reason: 'budget for this run is spent; will continue next time' });
+        recordPartial(state, key, descriptor, previous, now, 'stopped early: budget spent', stoppedAt);
+        // Not a failure, so it must not count towards giving up on the session.
+        const entry = state.sessions[key];
+        if (entry) entry.failureCount = previous?.failureCount ?? 0;
+        await checkpoint();
+        continue;
+      }
+
+      const declined = skippedReason(records);
+      if (declined !== undefined) {
+        await keep({
+          sessionId: descriptor.sessionId,
+          adapter: descriptor.adapter,
+          records: [],
+          eventCount: events.length,
+          undistilled: false,
+          skipped: declined,
+        });
+        report({ phase: 'done', ...where, records: 0, outcome: 'skipped', reason: declined });
+        recordSuccess(state, key, descriptor, highestOffset, now);
+        await checkpoint();
+        continue;
+      }
+
       const unread = partialFailures(records);
       const reasons = partialReasons(records);
 
@@ -319,15 +443,17 @@ export async function runSweep(
       });
 
       if (unread > 0) {
-        // Keep what was read, and leave the watermark where it was so the part
-        // that failed is read again next time rather than skipped in silence.
-        recordFailure(
+        // Keep what was read, and resume from the last call that worked rather
+        // than from the beginning. Leaving the watermark alone meant one failed
+        // call out of fifteen cost the other fourteen again on every sweep.
+        recordPartial(
           state,
           key,
           descriptor,
           previous,
           now,
-          new Error(`${unread} of the session could not be read and will be retried`),
+          `${unread} of the session could not be read and will be retried`,
+          partialCoveredTo(records),
         );
       } else {
         recordSuccess(state, key, descriptor, highestOffset, now);
@@ -365,6 +491,36 @@ function recordSuccess(
     lastSweptAt: now.toISOString(),
     lastError: null,
     failureCount: 0,
+  };
+}
+
+/**
+ * Keeps the ground an interrupted session gained, and keeps it eligible.
+ *
+ * `lastSeenModified` deliberately stays at its old value. Eligibility skips a
+ * session whose file has not changed since a sweep that advanced the watermark,
+ * so writing the current mtime here would advance the watermark and then refuse
+ * to look at the session again, silently abandoning the part that failed.
+ */
+function recordPartial(
+  state: SweepState,
+  key: string,
+  descriptor: SessionDescriptor,
+  previous: SweepState['sessions'][string] | undefined,
+  now: Date,
+  reason: string,
+  coveredTo: number | undefined,
+): void {
+  const earned = Math.max(previous?.watermark ?? -1, coveredTo ?? -1);
+
+  state.sessions[key] = {
+    sessionId: descriptor.sessionId,
+    adapter: descriptor.adapter,
+    watermark: earned,
+    lastSeenModified: previous?.lastSeenModified ?? '',
+    lastSweptAt: now.toISOString(),
+    lastError: reason,
+    failureCount: (previous?.failureCount ?? 0) + 1,
   };
 }
 

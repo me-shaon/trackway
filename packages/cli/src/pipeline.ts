@@ -1,5 +1,9 @@
 import { defaultRegistry, parseTranscript } from '@trackway/adapters';
 import {
+  readAllRecords,
+  readEpisodes,
+  writeEpisodes,
+  type Episode,
   attributeToPeople,
   commitsBetween,
   currentIdentity,
@@ -11,8 +15,14 @@ import {
   type MemoryRecord,
 } from '@trackway/core';
 import {
-  ClaudeDistillRunner,
+  addUsage,
+  organizeSession,
   createDistiller,
+  createRunnerChain,
+  defaultRunners,
+  emptyUsage,
+  insideDistillation,
+  type RunUsage,
   purgeCache,
   runSweep,
   type SweepProgress,
@@ -20,6 +30,8 @@ import {
 } from '@trackway/distill';
 import { isolate } from '@trackway/core';
 import { join } from 'node:path';
+import { acquireSyncLock } from './lock.js';
+import { recordSweep, sweepIsDue } from './schedule.js';
 import { openWorkspaceIndex, type Workspace } from './workspace.js';
 
 export interface SyncResult {
@@ -36,12 +48,25 @@ export interface SyncResult {
    * the person running it with nothing to go on.
    */
   errors: string[];
+  /** Set when the sweep deliberately did not run. Not a failure. */
+  halted?: string;
+  /** What the sweep spent. Reported, because a tool that quietly costs money loses trust. */
+  spend: RunUsage;
+  /** Model calls made. The unit cost actually scales with. */
+  calls: number;
 }
 
 export interface SyncOptions {
   maxSessions?: number;
+  /** Model calls this run may make. Cost scales with calls, so this is the real limit. */
+  maxCalls?: number;
   now?: Date;
   onProgress?: (event: SweepProgress) => void;
+  /**
+   * Run only if the configured interval has passed. The hook sets this; a
+   * person typing `trackway sync` does not, because they asked for it now.
+   */
+  ifDue?: boolean;
 }
 
 function empty(): SyncResult {
@@ -51,8 +76,27 @@ function empty(): SyncResult {
     skippedExisting: 0,
     purgedCacheFiles: 0,
     errors: [],
+    spend: emptyUsage(),
+    calls: 0,
   };
 }
+
+/**
+ * A sweep distils by starting an agent session, and an agent runs the
+ * developer's hooks when a session ends. The hook Trackway installs starts a
+ * sweep. So a sweep's own subprocess fired the hook that starts a sweep, and
+ * each of those did it again: thirty-nine concurrent syncs on a real machine in
+ * a few minutes, each spending its own model calls.
+ *
+ * The agent flag that suppresses hooks also disables the OAuth this depends on,
+ * so the recursion is refused here instead. Doing it on Trackway's side has the
+ * advantage of holding for every agent rather than one agent's flags.
+ */
+const REENTRANT = 'already running inside a distillation; refusing to sweep recursively';
+
+const BUSY = 'another sync is already running for this repository';
+
+const TOO_SOON = 'swept recently; the hook waits for the configured interval';
 
 /**
  * Sweep, distil, write records, update the index.
@@ -66,20 +110,72 @@ function empty(): SyncResult {
  * in `errors` for the caller to print.
  */
 export async function sync(workspace: Workspace, options: SyncOptions = {}): Promise<SyncResult> {
+  if (insideDistillation()) return { ...empty(), halted: REENTRANT };
+
+  // One sweep per repository. The hook fires per session ending, and three
+  // windows closing meant three sweeps racing over the same sessions, spending
+  // the same model calls and contending on the same index.
+  // Checked before the lock, because being early is not contention and costs
+  // nothing to answer.
+  if (
+    options.ifDue &&
+    !sweepIsDue(workspace.cacheDir, workspace.config.minSyncIntervalMinutes, options.now)
+  ) {
+    return { ...empty(), halted: TOO_SOON };
+  }
+
+  const lock = acquireSyncLock(workspace.cacheDir);
+  if (!lock) return { ...empty(), halted: BUSY };
+
   const errors: string[] = [];
 
-  const result = await isolate(() => runSync(workspace, options), empty(), {
-    operation: 'sync',
-    logPath: join(workspace.cacheDir, 'failures.log'),
-    onFailure: (failure) => errors.push(failure.message),
-  });
+  try {
+    const result = await isolate(() => runSync(workspace, options), empty(), {
+      operation: 'sync',
+      logPath: join(workspace.cacheDir, 'failures.log'),
+      onFailure: (failure) => errors.push(failure.message),
+    });
 
-  return { ...result, errors: [...result.errors, ...errors] };
+    // Stamped whether or not it found anything, and whether or not it failed.
+    // A sweep that failed is exactly the one that must not be retried on the
+    // very next turn of the developer's session.
+    recordSweep(workspace.cacheDir, options.now);
+
+    return { ...result, errors: [...result.errors, ...errors] };
+  } finally {
+    lock.release();
+  }
 }
 
 async function runSync(workspace: Workspace, options: SyncOptions): Promise<SyncResult> {
   const registry = defaultRegistry();
-  const distill = createDistiller({ runner: new ClaudeDistillRunner() });
+
+  let spend = emptyUsage();
+  let calls = 0;
+
+  const runner = createRunnerChain(defaultRunners());
+  const meter = { onUsage: (usage: RunUsage) => {
+    spend = addUsage(spend, usage);
+    calls += 1;
+  } };
+
+  // Wrapped rather than passed twice, so grouping is counted and reported like
+  // any other call instead of being spending nobody sees.
+  const metered = {
+    id: runner.id,
+    isAvailable: () => runner.isAvailable(),
+    run: (prompt: string, options = {}) => runner.run(prompt, { ...meter, ...options }),
+  };
+
+  // Shared across every session in this sweep, because the thing worth limiting
+  // is what the whole run costs, not what any one session costs.
+  const callBudget = options.maxCalls === undefined ? undefined : { remaining: options.maxCalls };
+
+  const distill = createDistiller({
+    runner,
+    onUsage: meter.onUsage,
+    ...(callBudget ? { callBudget } : {}),
+  });
 
   let written = 0;
   let skipped = 0;
@@ -91,6 +187,7 @@ async function runSync(workspace: Workspace, options: SyncOptions): Promise<Sync
     ...(options.maxSessions === undefined ? {} : { maxSessions: options.maxSessions }),
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+    ...(callBudget ? { hasBudget: () => callBudget.remaining > 0 } : {}),
 
     // One session at a time, as it finishes. Holding everything until the last
     // session meant a sweep that was interrupted after twenty minutes kept
@@ -110,7 +207,33 @@ async function runSync(workspace: Workspace, options: SyncOptions): Promise<Sync
 
       written += result.written;
       skipped += result.skipped;
+
+      // Grouping needs the whole session, and only makes sense once there is a
+      // whole session to group. A run that stopped early will be back.
+      //
+      // Counted against the same budget as everything else. Letting it through
+      // unmetered meant `--max-calls 8` spent ten, which makes the number a
+      // suggestion rather than a limit. A session skipped here is picked up by
+      // the catch-up pass on a later run, so nothing is lost by waiting.
+      const affordable = !callBudget || callBudget.remaining >= CALLS_PER_GROUPING;
+
+      if (session.partial === undefined && !session.incomplete && affordable) {
+        if (callBudget) callBudget.remaining -= CALLS_PER_GROUPING;
+        await isolate(() => group(workspace, metered, session.sessionId), undefined, {
+          operation: 'organize',
+          logPath: join(workspace.cacheDir, 'failures.log'),
+        });
+      }
     },
+  });
+
+  // Records written before grouping existed, or by a run that could not afford
+  // it, would otherwise stay ungrouped forever: their sessions are finished, so
+  // no future sweep will look at them again. Catching up here is the same
+  // self-heal every read command already does for distillation.
+  await isolate(() => catchUpGrouping(workspace, metered, callBudget), undefined, {
+    operation: 'organize',
+    logPath: join(workspace.cacheDir, 'failures.log'),
   });
 
   const purge = await purgeCache(
@@ -119,7 +242,15 @@ async function runSync(workspace: Workspace, options: SyncOptions): Promise<Sync
     options.now ?? new Date(),
   ).catch(() => ({ purged: 0, kept: 0 }));
 
-  return { sweep, written, skippedExisting: skipped, purgedCacheFiles: purge.purged, errors: [] };
+  return {
+    sweep,
+    written,
+    skippedExisting: skipped,
+    purgedCacheFiles: purge.purged,
+    errors: [],
+    spend,
+    calls,
+  };
 }
 
 /**
@@ -211,7 +342,7 @@ export async function ingestTranscript(
   const { descriptor, events } = parseTranscript(input);
 
   const distill = createDistiller({
-    runner: new ClaudeDistillRunner(),
+    runner: createRunnerChain(defaultRunners()),
     ...(options.now === undefined ? {} : { now: options.now }),
   });
 
@@ -226,4 +357,104 @@ export async function ingestTranscript(
     records: records.length,
     written,
   };
+}
+
+/**
+ * Fewest records worth grouping into topics.
+ *
+ * Two records are not a set of topics, they are two records, and asking costs a
+ * call to be told so.
+ */
+const WORTH_GROUPING = 3;
+
+/**
+ * Groups one session's records into topics and settles how important each is.
+ *
+ * Runs over everything the session has produced, not just what this sweep
+ * added, because a topic spans sweeps as easily as it spans chunks.
+ *
+ * This is what fills the explorer's topic list. Without it every record carries
+ * a null episodeId, `/api/overview` groups nothing, and the topic filter in the
+ * UI is a control that can never match anything.
+ */
+export async function group(
+  workspace: Workspace,
+  runner: Parameters<typeof organizeSession>[0],
+  sessionId: string,
+): Promise<void> {
+  const { records } = await readAllRecords(workspace.recordsDir);
+  const mine = records.filter((record) => record.sessionId === sessionId);
+
+  if (mine.length < WORTH_GROUPING) return;
+
+  // Regrouping costs the same whether one record arrived or fifty, so a couple
+  // of stragglers are left for the next time enough of them accumulate. Nothing
+  // is lost: they are grouped as soon as there are enough to be worth a call.
+  const ungrouped = mine.filter((record) => record.episodeId === null);
+  if (ungrouped.length < WORTH_GROUPING) return;
+
+  const organized = await organizeSession(runner, mine);
+  if (organized.episodes.length === 0) return;
+
+  // The model numbers topics from one for every session it sees, so the ids
+  // have to be made unique before they reach a store holding every session.
+  const prefix = sessionId.slice(0, 8);
+  const rename = (id: string): string => `${prefix}-${id}`;
+
+  const updated = organized.records.map((record) =>
+    record.episodeId === null ? record : { ...record, episodeId: rename(record.episodeId) },
+  );
+
+  await persist(workspace, updated);
+
+  const mineNow: Episode[] = organized.episodes.map((episode) => ({
+    id: rename(episode.id),
+    title: episode.title,
+    sessionId,
+  }));
+
+  // Read, replace this session's topics, write. Anything else would drop every
+  // other session's topics on each sweep.
+  const existing = await readEpisodes(workspace.storeDir);
+  await writeEpisodes(workspace.storeDir, [
+    ...existing.filter((episode) => episode.sessionId !== sessionId),
+    ...mineNow,
+  ]);
+}
+
+/** Calls one grouping costs, used to decide whether the budget can afford another. */
+const CALLS_PER_GROUPING = 2;
+
+/**
+ * Groups sessions whose records were written before anything grouped them.
+ *
+ * Bounded by the same budget as everything else, and it takes the smallest
+ * sessions first: grouping is priced per record, so the cheapest ones clear the
+ * backlog fastest and a single enormous session cannot eat a whole run.
+ */
+async function catchUpGrouping(
+  workspace: Workspace,
+  runner: Parameters<typeof organizeSession>[0],
+  budget: { remaining: number } | undefined,
+): Promise<void> {
+  const { records } = await readAllRecords(workspace.recordsDir);
+
+  const bySession = new Map<string, number>();
+  const ungrouped = new Set<string>();
+
+  for (const record of records) {
+    bySession.set(record.sessionId, (bySession.get(record.sessionId) ?? 0) + 1);
+    if (record.episodeId === null) ungrouped.add(record.sessionId);
+  }
+
+  const candidates = [...ungrouped]
+    .filter((id) => (bySession.get(id) ?? 0) >= WORTH_GROUPING)
+    .sort((a, b) => (bySession.get(a) ?? 0) - (bySession.get(b) ?? 0));
+
+  for (const sessionId of candidates) {
+    if (budget && budget.remaining < CALLS_PER_GROUPING) return;
+    if (budget) budget.remaining -= CALLS_PER_GROUPING;
+
+    await group(workspace, runner, sessionId);
+  }
 }

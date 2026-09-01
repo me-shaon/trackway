@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
+import { setPriority } from 'node:os';
 import { InvalidTranscriptError, defaultRegistry } from '@trackway/adapters';
 import {
   TrackwayConfig,
@@ -21,11 +22,23 @@ import {
   type MemoryRecord,
   type RecordType,
 } from '@trackway/core';
-import { loadState, type SweepProgress } from '@trackway/distill';
+import { defaultRunners, loadState, type SweepProgress } from '@trackway/distill';
 import { alternativeLine, detail, oneLine, shortDate, truncate } from '../format.js';
-import { hookCommand, hookTargets, installHook, isHookInstalled } from '../hook.js';
+import {
+  hookCommand,
+  hookTargets,
+  installGitHook,
+  installHook,
+  isGitHookInstalled,
+  isHookInstalled,
+} from '../hook.js';
 import { ingestTranscript, sync } from '../pipeline.js';
-import { createProgress, formatDuration, type ProgressOptions } from '../progress.js';
+import {
+  createProgress,
+  formatDuration,
+  formatTokens,
+  type ProgressOptions,
+} from '../progress.js';
 import {
   ensureIgnoreRules,
   loadWorkspace,
@@ -78,9 +91,16 @@ function describeOutcome(event: SweepProgress & { phase: 'done' }): string {
     case 'ingest-only':
       return 'read, but this agent cannot distil';
     case 'partial':
-      return `${event.records} record(s), part of it could not be read`;
+      // A run that stopped on budget and one that lost a region are both
+      // "finish this next time", but they are not the same news, so the reason
+      // is shown when there is one rather than assuming trouble.
+      return event.reason
+        ? `${event.records} record(s), ${truncate(event.reason, 70)}`
+        : `${event.records} record(s), part of it could not be read`;
     case 'failed':
       return `failed: ${truncate(event.reason ?? 'unknown', 80)}`;
+    case 'skipped':
+      return `skipped: ${truncate(event.reason ?? 'nothing worth extracting', 80)}`;
   }
 }
 
@@ -173,6 +193,22 @@ export function sweepReporter(io: Io, options: ProgressOptions = {}): SweepRepor
   };
 }
 
+/**
+ * Drops this process, and everything it spawns, below normal priority.
+ *
+ * A sweep is minutes of model subprocesses, each a few hundred megabytes. Run
+ * at normal priority from a hook that fires on every agent turn, it competes
+ * with the editor and the agent the developer is actually using. Failing to set
+ * it is not worth reporting: the sweep is still correct, just less polite.
+ */
+function yieldTheMachine(): void {
+  try {
+    setPriority(0, 10);
+  } catch {
+    // Not permitted on this platform or by this user. Carry on.
+  }
+}
+
 const NOT_A_REPO = 'Not inside a git repository. Trackway stores records per repository.';
 
 async function requireWorkspace(io: Io): Promise<Workspace | null> {
@@ -248,15 +284,29 @@ export async function initCommand(options: { hook?: boolean }, io: Io = consoleI
     return 0;
   }
 
+  // Claude Code is the only agent with a lifecycle hook, so a repository worked
+  // on through Codex or OpenCode never synced on its own. A commit fires
+  // whichever agent did the work, and it is already the moment the records are
+  // linked to.
+  io.out('');
+  const git = await installGitHook(workspace.repoRoot);
+  if (git.status === 'installed' || git.status === 'appended') {
+    io.out(`Git hook ${git.status === 'appended' ? 'added to' : 'installed at'} ${git.path}`);
+    io.out('This repository syncs on every commit, whichever agent did the work.');
+  } else if (git.status === 'failed') {
+    io.err(`Could not install the git hook: ${git.reason ?? 'unknown'}`);
+  }
+
   io.out('');
   for (const target of hookTargets()) {
-    if (await isHookInstalled(target)) {
-      io.out(`Hook already installed for ${target.agent}.`);
-      continue;
-    }
-
+    // Always offered to the installer rather than skipped when one is present.
+    // The command carries the bounding, so an entry from an older version has
+    // to be replaced; checking only for presence meant a fix to the hook never
+    // reached anybody who had already run this.
     const result = await installHook(target, hookCommand());
-    if (result.status === 'installed') {
+    if (result.status === 'already-present') {
+      io.out(`Hook already installed for ${target.agent}, and up to date.`);
+    } else if (result.status === 'installed') {
       io.out(`Hook installed for ${target.agent} in ${target.settingsPath}`);
       io.out('This is once per machine and covers every repository.');
     } else if (result.status === 'failed') {
@@ -269,11 +319,16 @@ export async function initCommand(options: { hook?: boolean }, io: Io = consoleI
 }
 
 export async function syncCommand(
-  options: { quiet?: boolean; max?: number },
+  options: { quiet?: boolean; max?: number; ifDue?: boolean; maxCalls?: number },
   io: Io = consoleIo,
 ): Promise<number> {
   const workspace = await requireWorkspace(io);
   if (!workspace) return 1;
+
+  // A hook-triggered sweep runs beside the developer's own work and must lose
+  // every contest for the machine. Children inherit this, so the agent
+  // subprocesses it spawns are niced too.
+  if (options.ifDue) yieldTheMachine();
 
   const startedAt = Date.now();
 
@@ -283,18 +338,48 @@ export async function syncCommand(
   // spinner ticking over the summary.
   const result = await sync(workspace, {
     ...(options.max === undefined ? {} : { maxSessions: options.max }),
+    ...(options.maxCalls === undefined ? {} : { maxCalls: options.maxCalls }),
+    ...(options.ifDue ? { ifDue: true } : {}),
     ...(reporter ? { onProgress: reporter.report } : {}),
   }).finally(() => reporter?.finish());
 
   if (options.quiet) return 0;
 
-  const distilled = result.sweep.swept.filter((s) => !s.undistilled).length;
+  // Not an error and not a sweep: say which, rather than reporting zero
+  // sessions as though there were none to do.
+  if (result.halted) {
+    io.out(`Did not sync: ${result.halted}.`);
+    return 0;
+  }
+
+  const skippedSessions = result.sweep.swept.filter((s) => s.skipped !== undefined);
+  const distilled = result.sweep.swept.filter(
+    (s) => !s.undistilled && s.skipped === undefined,
+  ).length;
   const undistilled = result.sweep.swept.filter((s) => s.undistilled).length;
 
   io.out(`Swept ${result.sweep.swept.length} session(s) in ${formatDuration(Date.now() - startedAt)}.`);
   io.out(`  distilled:   ${distilled}`);
   if (undistilled > 0) io.out(`  ingest only: ${undistilled} (agent cannot distil)`);
+  // Worth its own line rather than being folded into "ingest only": these cost
+  // no model call at all, and saying why keeps the count from looking like
+  // sessions that were dropped.
+  if (skippedSessions.length > 0) {
+    io.out(
+      `  skipped:     ${skippedSessions.length} (${skippedSessions[0]?.skipped ?? 'nothing to extract'})`,
+    );
+  }
   io.out(`  records:     ${result.written} new, ${result.skippedExisting} already present`);
+
+  // What it cost, every time. A tool that spends money in the background and
+  // never says how much is one people stop running.
+  if (result.calls > 0) {
+    const { spend } = result;
+    const cost = spend.costUsd > 0 ? `, $${spend.costUsd.toFixed(3)}` : '';
+    io.out(
+      `  spent:       ${result.calls} model call(s), ${formatTokens(spend.inputTokens)} in / ${formatTokens(spend.outputTokens)} out${cost}`,
+    );
+  }
 
   if (result.sweep.deferred > 0) {
     io.out(`  deferred:    ${result.sweep.deferred} (run again to continue)`);
@@ -303,6 +388,13 @@ export async function syncCommand(
   // A session read in several calls can lose one of them after retries. The
   // records that did come back are kept, and the region that failed is read
   // again next sweep rather than skipped in silence.
+  const unfinished = result.sweep.swept.filter((session) => session.incomplete);
+  if (unfinished.length > 0) {
+    io.out(
+      `  unfinished:  ${unfinished.length} session(s) stopped when the call budget ran out; run again to continue`,
+    );
+  }
+
   const partial = result.sweep.swept.filter((session) => (session.partial ?? 0) > 0);
   if (partial.length > 0) {
     io.out(
@@ -371,10 +463,35 @@ export async function statusCommand(_options: unknown, io: Io = consoleIo): Prom
     io.out(`  ${status.id.padEnd(12)} ${state}`);
   }
 
+  // An adapter being present says a session can be read. It says nothing about
+  // whether anything on this machine can distil it, and that is the failure
+  // people actually hit: sessions pile up and every sweep reports the same
+  // error per session.
+  io.out('\nDistillers:');
+  const runners = await Promise.all(
+    defaultRunners().map(async (runner) => ({
+      id: runner.id,
+      availability: await runner.isAvailable().catch(() => ({ available: false as const })),
+    })),
+  );
+  for (const { id, availability } of runners) {
+    const state = availability.available
+      ? 'ready'
+      : `unavailable: ${truncate('reason' in availability ? (availability.reason ?? 'unknown') : 'unknown', 50)}`;
+    io.out(`  ${id.padEnd(12)} ${state}`);
+  }
+  if (!runners.some((runner) => runner.availability.available)) {
+    io.out('  Nothing here can distil. Sessions will be found but produce no records.');
+  }
+
   io.out('\nHooks:');
   for (const target of hookTargets()) {
     io.out(`  ${target.agent.padEnd(12)} ${(await isHookInstalled(target)) ? 'installed' : 'not installed'}`);
   }
+  // The one that covers the agents with no hook of their own.
+  io.out(
+    `  ${'git commit'.padEnd(12)} ${(await isGitHookInstalled(workspace.repoRoot)) ? 'installed' : 'not installed'}`,
+  );
 
   // A session that went quiet and never got distilled is the symptom of a
   // broken trigger. Reporting it is what turns silent breakage into visible.
