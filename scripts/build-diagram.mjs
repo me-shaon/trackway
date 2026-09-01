@@ -145,7 +145,7 @@ function draw(c) {
   ${elbow(leftX + laneW / 2, laneY + laneH + 30, mid, 346, c)}
   ${elbow(rightX + laneW / 2, laneY + laneH + 30, mid, 346, c)}
 
-  ${panel({ x: boxX, y: 348, w: boxW, h: 66, title: '.trackway/records/*.md', sub: 'git-tracked — they show up in your diffs', c, accent: c.store, fill: c.storeFill, mono: true })}
+  ${panel({ x: boxX, y: 348, w: boxW, h: 66, title: '.trackway/records/*.md', sub: 'git-tracked, so they show up in your diffs', c, accent: c.store, fill: c.storeFill, mono: true })}
 
   ${down(mid, 416, 440, c)}
   ${panel({ x: boxX, y: 442, w: boxW, h: 44, title: 'search  ·  explorer  ·  MCP retrieval', c })}

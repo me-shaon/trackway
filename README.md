@@ -71,7 +71,7 @@ Coding agents write every session to disk as they go. Trackway reads those files
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/me-shaon/trackway/main/docs/pipeline-dark.svg">
     <img
-      alt="The Trackway pipeline. Agent session files, written to disk by the agent as you work — nothing is hooked, you keep working normally. Those are parsed, with model reasoning stripped and credentials redacted. Extraction then splits in two: the options you were offered are copied verbatim out of the session with no model call, which is deterministic, and everything else is distilled by your own agent running headless, which is model-extracted. Both feed .trackway/records/*.md, which is git-tracked and shows up in your diffs, and those records are read back through search, the explorer, and MCP retrieval."
+      alt="The Trackway pipeline. Agent session files, written to disk by the agent as you work. Nothing is hooked, you keep working normally. Those are parsed, with model reasoning stripped and credentials redacted. Extraction then splits in two: the options you were offered are copied verbatim out of the session with no model call, which is deterministic, and everything else is distilled by your own agent running headless, which is model-extracted. Both feed .trackway/records/*.md, which is git-tracked and shows up in your diffs, and those records are read back through search, the explorer, and MCP retrieval."
       src="https://raw.githubusercontent.com/me-shaon/trackway/main/docs/pipeline-light.svg"
       width="880">
   </picture>

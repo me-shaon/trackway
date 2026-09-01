@@ -91,7 +91,7 @@
           font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="14"
           font-weight="600" fill="#22262c">.trackway/records/*.md</text>
     <text x="390" y="394" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
-                 font-size="11.5" fill="#6a7179">git-tracked — they show up in your diffs</text>
+                 font-size="11.5" fill="#6a7179">git-tracked, so they show up in your diffs</text>
   </g>
 
   <path d="M390 416 V440" stroke="#9aa0a7" stroke-width="1.4"
