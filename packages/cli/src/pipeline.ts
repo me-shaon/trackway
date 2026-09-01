@@ -1,5 +1,9 @@
 import { defaultRegistry, parseTranscript } from '@trackway/adapters';
 import {
+  readAllRecords,
+  readEpisodes,
+  writeEpisodes,
+  type Episode,
   attributeToPeople,
   commitsBetween,
   currentIdentity,
@@ -12,6 +16,7 @@ import {
 } from '@trackway/core';
 import {
   addUsage,
+  organizeSession,
   createDistiller,
   createRunnerChain,
   defaultRunners,
@@ -148,16 +153,27 @@ async function runSync(workspace: Workspace, options: SyncOptions): Promise<Sync
   let spend = emptyUsage();
   let calls = 0;
 
+  const runner = createRunnerChain(defaultRunners());
+  const meter = { onUsage: (usage: RunUsage) => {
+    spend = addUsage(spend, usage);
+    calls += 1;
+  } };
+
+  // Wrapped rather than passed twice, so grouping is counted and reported like
+  // any other call instead of being spending nobody sees.
+  const metered = {
+    id: runner.id,
+    isAvailable: () => runner.isAvailable(),
+    run: (prompt: string, options = {}) => runner.run(prompt, { ...meter, ...options }),
+  };
+
   // Shared across every session in this sweep, because the thing worth limiting
   // is what the whole run costs, not what any one session costs.
   const callBudget = options.maxCalls === undefined ? undefined : { remaining: options.maxCalls };
 
   const distill = createDistiller({
-    runner: createRunnerChain(defaultRunners()),
-    onUsage: (usage) => {
-      spend = addUsage(spend, usage);
-      calls += 1;
-    },
+    runner,
+    onUsage: meter.onUsage,
     ...(callBudget ? { callBudget } : {}),
   });
 
@@ -191,7 +207,33 @@ async function runSync(workspace: Workspace, options: SyncOptions): Promise<Sync
 
       written += result.written;
       skipped += result.skipped;
+
+      // Grouping needs the whole session, and only makes sense once there is a
+      // whole session to group. A run that stopped early will be back.
+      //
+      // Counted against the same budget as everything else. Letting it through
+      // unmetered meant `--max-calls 8` spent ten, which makes the number a
+      // suggestion rather than a limit. A session skipped here is picked up by
+      // the catch-up pass on a later run, so nothing is lost by waiting.
+      const affordable = !callBudget || callBudget.remaining >= CALLS_PER_GROUPING;
+
+      if (session.partial === undefined && !session.incomplete && affordable) {
+        if (callBudget) callBudget.remaining -= CALLS_PER_GROUPING;
+        await isolate(() => group(workspace, metered, session.sessionId), undefined, {
+          operation: 'organize',
+          logPath: join(workspace.cacheDir, 'failures.log'),
+        });
+      }
     },
+  });
+
+  // Records written before grouping existed, or by a run that could not afford
+  // it, would otherwise stay ungrouped forever: their sessions are finished, so
+  // no future sweep will look at them again. Catching up here is the same
+  // self-heal every read command already does for distillation.
+  await isolate(() => catchUpGrouping(workspace, metered, callBudget), undefined, {
+    operation: 'organize',
+    logPath: join(workspace.cacheDir, 'failures.log'),
   });
 
   const purge = await purgeCache(
@@ -315,4 +357,104 @@ export async function ingestTranscript(
     records: records.length,
     written,
   };
+}
+
+/**
+ * Fewest records worth grouping into topics.
+ *
+ * Two records are not a set of topics, they are two records, and asking costs a
+ * call to be told so.
+ */
+const WORTH_GROUPING = 3;
+
+/**
+ * Groups one session's records into topics and settles how important each is.
+ *
+ * Runs over everything the session has produced, not just what this sweep
+ * added, because a topic spans sweeps as easily as it spans chunks.
+ *
+ * This is what fills the explorer's topic list. Without it every record carries
+ * a null episodeId, `/api/overview` groups nothing, and the topic filter in the
+ * UI is a control that can never match anything.
+ */
+export async function group(
+  workspace: Workspace,
+  runner: Parameters<typeof organizeSession>[0],
+  sessionId: string,
+): Promise<void> {
+  const { records } = await readAllRecords(workspace.recordsDir);
+  const mine = records.filter((record) => record.sessionId === sessionId);
+
+  if (mine.length < WORTH_GROUPING) return;
+
+  // Regrouping costs the same whether one record arrived or fifty, so a couple
+  // of stragglers are left for the next time enough of them accumulate. Nothing
+  // is lost: they are grouped as soon as there are enough to be worth a call.
+  const ungrouped = mine.filter((record) => record.episodeId === null);
+  if (ungrouped.length < WORTH_GROUPING) return;
+
+  const organized = await organizeSession(runner, mine);
+  if (organized.episodes.length === 0) return;
+
+  // The model numbers topics from one for every session it sees, so the ids
+  // have to be made unique before they reach a store holding every session.
+  const prefix = sessionId.slice(0, 8);
+  const rename = (id: string): string => `${prefix}-${id}`;
+
+  const updated = organized.records.map((record) =>
+    record.episodeId === null ? record : { ...record, episodeId: rename(record.episodeId) },
+  );
+
+  await persist(workspace, updated);
+
+  const mineNow: Episode[] = organized.episodes.map((episode) => ({
+    id: rename(episode.id),
+    title: episode.title,
+    sessionId,
+  }));
+
+  // Read, replace this session's topics, write. Anything else would drop every
+  // other session's topics on each sweep.
+  const existing = await readEpisodes(workspace.storeDir);
+  await writeEpisodes(workspace.storeDir, [
+    ...existing.filter((episode) => episode.sessionId !== sessionId),
+    ...mineNow,
+  ]);
+}
+
+/** Calls one grouping costs, used to decide whether the budget can afford another. */
+const CALLS_PER_GROUPING = 2;
+
+/**
+ * Groups sessions whose records were written before anything grouped them.
+ *
+ * Bounded by the same budget as everything else, and it takes the smallest
+ * sessions first: grouping is priced per record, so the cheapest ones clear the
+ * backlog fastest and a single enormous session cannot eat a whole run.
+ */
+async function catchUpGrouping(
+  workspace: Workspace,
+  runner: Parameters<typeof organizeSession>[0],
+  budget: { remaining: number } | undefined,
+): Promise<void> {
+  const { records } = await readAllRecords(workspace.recordsDir);
+
+  const bySession = new Map<string, number>();
+  const ungrouped = new Set<string>();
+
+  for (const record of records) {
+    bySession.set(record.sessionId, (bySession.get(record.sessionId) ?? 0) + 1);
+    if (record.episodeId === null) ungrouped.add(record.sessionId);
+  }
+
+  const candidates = [...ungrouped]
+    .filter((id) => (bySession.get(id) ?? 0) >= WORTH_GROUPING)
+    .sort((a, b) => (bySession.get(a) ?? 0) - (bySession.get(b) ?? 0));
+
+  for (const sessionId of candidates) {
+    if (budget && budget.remaining < CALLS_PER_GROUPING) return;
+    if (budget) budget.remaining -= CALLS_PER_GROUPING;
+
+    await group(workspace, runner, sessionId);
+  }
 }

@@ -473,3 +473,60 @@ describe('stopping cleanly when the budget is gone', () => {
     expect(result.deferred).toBe(2);
   });
 });
+
+describe('not paying to group what is already grouped', () => {
+  const discovery = (significance: string, id: string) => ({
+    id,
+    type: 'discovery' as const,
+    sessionId: 'ses-1',
+    episodeId: null,
+    commits: [],
+    significance,
+    createdAt: '2026-09-01T09:00:00Z',
+    source: { adapter: 'claude-code', sessionId: 'ses-1', sessionFile: '/tmp/a.jsonl', fromOffset: 0, toOffset: 1 },
+    text: 'Something was found.',
+  });
+
+  // The extraction pass already marks a good share of discoveries as working.
+  // Asking about a batch where every one is hidden costs a call to be told
+  // what we can see for ourselves.
+  it('does not call out when every discovery is already demoted', async () => {
+    const { triageDiscoveries } = await import('../src/index.js');
+    let called = 0;
+    const runner: DistillRunner = {
+      id: 'stub',
+      isAvailable: async () => ({ available: true }),
+      run: async () => {
+        called += 1;
+        return JSON.stringify({ own: [] });
+      },
+    };
+
+    await triageDiscoveries(runner, [
+      discovery('working', 'a') as never,
+      discovery('working', 'b') as never,
+    ]);
+
+    expect(called).toBe(0);
+  });
+
+  it('still calls out when something is on show', async () => {
+    const { triageDiscoveries } = await import('../src/index.js');
+    let called = 0;
+    const runner: DistillRunner = {
+      id: 'stub',
+      isAvailable: async () => ({ available: true }),
+      run: async () => {
+        called += 1;
+        return JSON.stringify({ own: [] });
+      },
+    };
+
+    await triageDiscoveries(runner, [
+      discovery('working', 'a') as never,
+      discovery('technical', 'b') as never,
+    ]);
+
+    expect(called).toBe(1);
+  });
+});
