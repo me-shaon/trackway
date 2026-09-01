@@ -90,3 +90,12 @@ export function Moon({ size = 15 }: Props) {
     </svg>
   );
 }
+
+/** The work the records describe. */
+export function Folder({ size = 15 }: Props) {
+  return (
+    <svg {...base(size)}>
+      <path d="M14.67 12.67a1.33 1.33 0 01-1.34 1.33H2.67a1.33 1.33 0 01-1.34-1.33V3.33a1.33 1.33 0 011.34-1.33H6l1.33 2h6a1.33 1.33 0 011.34 1.33z" />
+    </svg>
+  );
+}

@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState, type ComponentType, type ReactElement } from 'react';
+import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactElement } from 'react';
 import { api } from './api.js';
-import { Caret, Monitor, Moon, Search as SearchIcon, Sun } from './icons.js';
+import { Caret, Check, Folder, Monitor, Moon, Search as SearchIcon, Sun } from './icons.js';
 import { Rail } from './Rail.js';
 import { applyTheme, readTheme, THEMES, type Theme } from './theme.js';
 import { Decisions } from './views/Decisions.js';
@@ -41,12 +41,13 @@ const THEME_ICON: Record<Theme, ComponentType<{ size?: number }>> = {
  * choices were without pressing it, which is the wrong trade for a control
  * someone touches once and then leaves alone.
  *
- * A native select so the menu, the keyboard, and the screen reader all behave
- * the way the reader's platform already does. The icon states the current
- * ground; the select is transparent over it.
+ * The open list is drawn by this page.
  */
 function ThemeChoice(): ReactElement {
   const [theme, setTheme] = useState<Theme>(() => readTheme());
+  const [open, setOpen] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const items = useRef<Array<HTMLButtonElement | null>>([]);
 
   // The inline script in the document has already applied a stored choice
   // before paint. This keeps the attribute in step with later changes.
@@ -54,31 +55,96 @@ function ThemeChoice(): ReactElement {
     applyTheme(theme);
   }, [theme]);
 
+  useEffect(() => {
+    if (!open) return;
+
+    const away = (event: MouseEvent) => {
+      if (event.target instanceof Node && trigger.current?.closest('.theme')?.contains(event.target))
+        return;
+      setOpen(false);
+    };
+
+    document.addEventListener('mousedown', away);
+    return () => document.removeEventListener('mousedown', away);
+  }, [open]);
+
+  useEffect(() => {
+    if (open) items.current[THEMES.indexOf(theme)]?.focus();
+  }, [open]);
+
+  const choose = (next: Theme) => {
+    setTheme(next);
+    setOpen(false);
+    trigger.current?.focus();
+  };
+
+  const step = (from: Theme, delta: number) => {
+    const next = (THEMES.indexOf(from) + delta + THEMES.length) % THEMES.length;
+    items.current[next]?.focus();
+  };
+
   const Icon = THEME_ICON[theme];
 
   return (
     <div className="theme">
-      <Icon />
-      <span>{THEME_LABEL[theme]}</span>
-      <Caret size={11} />
-
-      {/*
-        The select covers the whole control rather than sitting between the
-        icon and the caret. As a sibling it only ever received clicks on its
-        own text box, so pressing the icon did nothing. It is the real
-        control and carries the label; everything above it is the drawing.
-      */}
-      <select
-        value={theme}
-        aria-label="Colour theme"
-        onChange={(event) => setTheme(event.target.value as Theme)}
+      <button
+        ref={trigger}
+        type="button"
+        className="theme-btn"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        // A button's accessible name is whatever is inside it, so on its own
+        // this announced as "System" with no clue what it controls. The select
+        // this replaced carried the purpose separately from the value; both
+        // belong in the name here.
+        aria-label={`Colour theme: ${THEME_LABEL[theme]}`}
+        onClick={() => setOpen((was) => !was)}
+        onKeyDown={(event) => {
+          if (open && event.key === 'Escape') setOpen(false);
+        }}
       >
-        {THEMES.map((option) => (
-          <option key={option} value={option}>
-            {THEME_LABEL[option]}
-          </option>
-        ))}
-      </select>
+        <Icon />
+        <span>{THEME_LABEL[theme]}</span>
+        <Caret size={11} />
+      </button>
+
+      {open && (
+        <ul className="theme-menu" role="menu" aria-label="Colour theme">
+          {THEMES.map((option, index) => {
+            const OptionIcon = THEME_ICON[option];
+            return (
+              <li key={option} role="presentation">
+                <button
+                  ref={(element) => {
+                    items.current[index] = element;
+                  }}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={option === theme}
+                  tabIndex={-1}
+                  onClick={() => choose(option)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'ArrowDown') {
+                      event.preventDefault();
+                      step(option, 1);
+                    } else if (event.key === 'ArrowUp') {
+                      event.preventDefault();
+                      step(option, -1);
+                    } else if (event.key === 'Escape') {
+                      setOpen(false);
+                      trigger.current?.focus();
+                    }
+                  }}
+                >
+                  <OptionIcon />
+                  <span>{THEME_LABEL[option]}</span>
+                  {option === theme ? <Check className="mark" size={13} /> : null}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </div>
   );
 }
@@ -105,6 +171,7 @@ export function App(): ReactElement {
   const [records, setRecords] = useState<MemoryRecord[] | null>(null);
   const [episodes, setEpisodes] = useState<Episode[]>([]);
   const [forge, setForge] = useState<Forge | undefined>(undefined);
+  const [project, setProject] = useState<string | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
 
   const [active, setActive] = useState<Set<Significance>>(new Set(LIT));
@@ -121,6 +188,7 @@ export function App(): ReactElement {
         setRecords(r.records);
         setEpisodes(o.episodes);
         setForge(o.forge);
+        setProject(o.project);
       })
       .catch((cause: unknown) => setError(String(cause)));
   }, [sessionId]);
@@ -160,6 +228,11 @@ export function App(): ReactElement {
   // and returns you where you were, so search never costs you your place.
   const searching = query.trim().length >= 2;
 
+  // The tab says which project this explorer is reading.
+  useEffect(() => {
+    document.title = project ? `Trackway — ${project}` : 'Trackway';
+  }, [project]);
+
   return (
     <div className="shell">
       <header className="topbar">
@@ -189,21 +262,29 @@ export function App(): ReactElement {
             </div>
           </div>
 
-          <nav className="tabs" aria-label="Views">
-            {TABS.map(([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                aria-current={!searching && view === id}
-                onClick={() => {
-                  setQuery('');
-                  setView(id);
-                }}
-              >
-                {label}
-              </button>
-            ))}
-          </nav>
+          <div>
+            {project ? (
+              <div className="project" title="The project that's being explored">
+                <Folder />
+                <span>{project}</span>
+              </div>
+            ) : null}
+            <nav className="tabs" aria-label="Views">
+              {TABS.map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  aria-current={!searching && view === id}
+                  onClick={() => {
+                    setQuery('');
+                    setView(id);
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </nav>
+          </div>
         </div>
       </header>
 

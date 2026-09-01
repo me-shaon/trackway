@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { startExplorer } from '@trackway/server';
 import { spawn } from 'node:child_process';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openWorkspaceIndex, type Workspace } from '../workspace.js';
 import type { Io } from './index.js';
@@ -49,6 +49,7 @@ export async function graphCommand(
     storeDir: workspace.storeDir,
     uiDir: resolveUiDir(),
     repoRoot: workspace.repoRoot,
+    projectName: workspace.config.projectName ?? basename(workspace.repoRoot),
     ...(options.port === undefined ? {} : { port: options.port }),
   });
 

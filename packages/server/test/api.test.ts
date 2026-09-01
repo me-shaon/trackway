@@ -167,6 +167,22 @@ describe('the data API', () => {
     expect(body.counts).toMatchObject({ sessions: 1, records: 2, decisions: 1, rejected: 1 });
   });
 
+  it('names the project when the workspace resolved one', async () => {
+    const response = await createExplorerApp({ db, uiDir, projectName: 'trackway' }).request(
+      '/api/overview',
+    );
+    const body = (await response.json()) as { project?: string };
+
+    expect(body.project).toBe('trackway');
+  });
+
+  it('says nothing about the project when no name is known', async () => {
+    const body = await json<Record<string, unknown>>('/api/overview');
+
+    // Omitted rather than guessed
+    expect('project' in body).toBe(false);
+  });
+
   it('exposes no endpoint that returns raw events', async () => {
     // The explorer must render distilled records only, and the surest way to
     // guarantee that is to give it no way to ask for anything else.

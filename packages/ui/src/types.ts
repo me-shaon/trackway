@@ -122,6 +122,7 @@ export interface Forge {
 }
 
 export interface Overview {
+  project?: string;
   forge?: Forge;
   sessions: SessionSummary[];
   episodes: Episode[];

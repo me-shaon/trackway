@@ -20,6 +20,12 @@ export const TrackwayConfig = z.strictObject({
   storePath: z.string().min(1).default(DEFAULT_STORE_DIR),
 
   /**
+   * What the project is called, shown in the explorer so a reader can tell
+   * which repository they are reading.
+   */
+  projectName: z.string().min(1).optional(),
+
+  /**
    * A session file untouched for this long is eligible for distillation.
    * A file still being written is never touched, so an active session never
    * contends with the developer's own agent.

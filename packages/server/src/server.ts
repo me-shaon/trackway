@@ -10,6 +10,8 @@ export interface ExplorerOptions {
   db: IndexDatabase;
   storeDir?: string;
   repoRoot?: string;
+  /** What the project is called. */
+  projectName?: string;
   /** Directory holding the prebuilt explorer. */
   uiDir: string;
   port?: number;
@@ -23,7 +25,7 @@ export interface RunningExplorer {
 }
 
 export function createExplorerApp(
-  options: Pick<ExplorerOptions, 'db' | 'uiDir' | 'storeDir' | 'repoRoot'>,
+  options: Pick<ExplorerOptions, 'db' | 'uiDir' | 'storeDir' | 'repoRoot' | 'projectName'>,
 ): Hono {
   const app = new Hono();
 
@@ -38,6 +40,7 @@ export function createExplorerApp(
       db: options.db,
       ...(options.storeDir ? { storeDir: options.storeDir } : {}),
       ...(options.repoRoot ? { repoRoot: options.repoRoot } : {}),
+      ...(options.projectName ? { projectName: options.projectName } : {}),
     }),
   );
 

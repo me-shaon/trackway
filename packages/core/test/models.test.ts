@@ -285,6 +285,12 @@ describe('TrackwayConfig', () => {
     expect(config.quietWindowMinutes).toBe(15);
     expect(config.cacheRetentionDays).toBe(30);
     expect(config.adapters).toEqual(['claude-code', 'codex', 'opencode']);
+    expect(config.projectName).toBeUndefined();
+  });
+
+  it('accepts an optional project name and refuses a blank one', () => {
+    expect(TrackwayConfig.safeParse({ projectName: 'trackway' }).success).toBe(true);
+    expect(TrackwayConfig.safeParse({ projectName: '' }).success).toBe(false);
   });
 
   it('rejects a non-positive quiet window', () => {

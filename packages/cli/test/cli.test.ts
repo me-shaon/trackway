@@ -2,7 +2,7 @@ import { describeActor } from '../src/format.js';
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +13,7 @@ import {
   forgetCommand,
   hookCommand,
   ingestCommand,
+  initCommand,
   hookTargets,
   installHook,
   isHookInstalled,
@@ -136,6 +137,15 @@ describe('workspace', () => {
     await writeConfig(join(repo, '.trackway'), config);
 
     expect((await readConfig(repo)).quietWindowMinutes).toBe(42);
+  });
+
+  it('prefills the project name from the repository directory at init', async () => {
+    await initCommand({ hook: false }, captureIo());
+
+    const raw = await readFile(join(repo, '.trackway', 'config.yml'), 'utf8');
+
+    expect(raw).toContain(`projectName: ${basename(repo)}`);
+    expect((await readConfig(repo)).projectName).toBe(basename(repo));
   });
 
   it('keeps the event cache outside the repository', async () => {
@@ -1232,5 +1242,42 @@ describe('running init again after an upgrade', () => {
 
     expect(result.status).toBe('installed');
     expect(await readFile(settingsPath, 'utf8')).toContain('--if-due');
+  });
+});
+
+describe('running init on a repository that is already set up', () => {
+  /*
+   * Re-running init is how a hook from an older version gets replaced, so it
+   * runs on repositories configured months ago. Writing defaults over them
+   * silently undid a tuned quiet window, and the project name this same
+   * command invites people to edit.
+   */
+  it('keeps settings that were already there', async () => {
+    await writeConfig(join(repo, '.trackway'), {
+      storePath: '.trackway',
+      projectName: 'Renamed By Hand',
+      quietWindowMinutes: 45,
+      cacheRetentionDays: 7,
+      minSyncIntervalMinutes: 30,
+      adapters: ['claude-code'],
+    });
+
+    await initCommand({ hook: false }, captureIo());
+
+    const config = await readConfig(repo);
+    expect(config.projectName).toBe('Renamed By Hand');
+    expect(config.quietWindowMinutes).toBe(45);
+    expect(config.cacheRetentionDays).toBe(7);
+    expect(config.minSyncIntervalMinutes).toBe(30);
+    expect(config.adapters).toEqual(['claude-code']);
+  });
+
+  it('still fills in a project name when there is none', async () => {
+    const io = captureIo();
+
+    await initCommand({ hook: false }, io);
+
+    expect((await readConfig(repo)).projectName).toBe(basename(repo));
+    expect(io.lines.join('\n')).toContain('project:');
   });
 });

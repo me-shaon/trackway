@@ -310,16 +310,31 @@ code {
   gap: 14px;
 }
 
+.project {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 4px 0 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+  font-size: 14px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
 /*
   The ground control.
 
   Shaped like the search field beside it rather than invented separately: an
-  icon, a transparent field, and no border until it is reached for. The select
-  is the real control and carries the platform's own menu; everything here is
-  the frame around it.
+  icon, a quiet label, and no border until it is reached for. The button is
+  the whole control now; the menu it opens is drawn below.
 */
 .theme {
   position: relative;
+}
+
+.theme-btn {
   display: flex;
   align-items: center;
   gap: 7px;
@@ -333,46 +348,68 @@ code {
     color 0.2s var(--ease);
 }
 
-.theme:hover {
+.theme-btn:hover {
   color: var(--ink-2);
   border-color: var(--hair);
 }
 
-.theme:focus-within {
+.theme-btn:focus-visible {
   color: var(--ink-2);
   border-color: var(--focus);
   box-shadow: 0 0 0 1px var(--focus);
 }
 
-.theme > span {
+.theme-btn > span {
   font-size: 14px;
   color: var(--ink-2);
 }
 
 /*
-  Laid over the whole control, not placed inside it.
-
-  Transparent rather than hidden: a select with `display: none` or
-  `visibility: hidden` stops being focusable, and one sized to its own text
-  leaves the icon and the caret dead to the pointer, which is what they were.
+  The open list, drawn by the page rather than handed to the platform.
 */
-.theme select {
+.theme-menu {
   position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  appearance: none;
-  border: none;
-  background: none;
-  padding: 0;
-  font: inherit;
-  color: transparent;
-  cursor: pointer;
-  opacity: 0;
+  top: calc(100% + 7px);
+  right: 0;
+  min-width: 142px;
+  margin: 0;
+  padding: 5px;
+  list-style: none;
+  background: var(--sunk);
+  border: 1px solid var(--hair-2);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  z-index: 30;
 }
 
-.theme select:focus {
-  outline: none;
+.theme-menu button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 2px;
+  font-size: 14px;
+  color: var(--ink-2);
+  text-align: left;
+  transition:
+    background 0.15s var(--ease),
+    color 0.15s var(--ease);
+}
+
+.theme-menu button:hover,
+.theme-menu button:focus-visible {
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+  color: var(--ink);
+}
+
+.theme-menu button[aria-checked='true'] {
+  color: var(--ink);
+}
+
+.theme-menu .mark {
+  margin-left: auto;
+  color: var(--ink-3);
 }
 
 .tabs button {

@@ -21,6 +21,8 @@ export interface ApiOptions {
   storeDir?: string;
   /** Working tree the records describe, so commits can be linked to their forge. */
   repoRoot?: string;
+  /** What the project is called. */
+  projectName?: string;
 }
 
 export interface TimelineEntry {
@@ -164,6 +166,7 @@ export function createApi(options: ApiOptions): Hono {
     const forge = options.repoRoot ? await detectForge(options.repoRoot) : null;
 
     return c.json({
+      ...(options.projectName ? { project: options.projectName } : {}),
       ...(forge ? { forge: { host: forge.host, commitUrl: forge.commitUrl('COMMIT') } } : {}),
       sessions,
       episodes: grouped,

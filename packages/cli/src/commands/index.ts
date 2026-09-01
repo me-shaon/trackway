@@ -1,9 +1,8 @@
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { setPriority } from 'node:os';
 import { InvalidTranscriptError, defaultRegistry } from '@trackway/adapters';
 import {
-  TrackwayConfig,
   blameLine,
   commitBySha,
   commitsTouching,
@@ -258,11 +257,18 @@ export async function initCommand(options: { hook?: boolean }, io: Io = consoleI
   const workspace = await requireWorkspace(io);
   if (!workspace) return 1;
 
-  await writeConfig(workspace.storeDir, TrackwayConfig.parse({}));
+  // Whatever is already configured is kept. Re-running init is how a hook from
+  // an older version gets replaced, so it is run on repositories that have been
+  // set up for months; writing defaults over them would silently undo a tuned
+  // quiet window, or the project name this very command invites people to edit.
+  const project = workspace.config.projectName ?? basename(workspace.repoRoot);
+  await writeConfig(workspace.storeDir, { ...workspace.config, projectName: project });
+
   const ignore = await ensureIgnoreRules(workspace.storeDir);
 
   io.out(`Initialized Trackway in ${workspace.storeDir}`);
   io.out(`  config:      ${workspace.config.storePath}/config.yml`);
+  io.out(`  project:     ${project} (projectName in config.yml, edit freely)`);
   io.out(`  records:     ${workspace.config.storePath}/records/  (tracked by git)`);
   io.out(`  index:       ${workspace.config.storePath}/index.sqlite  (${ignore === 'created' ? 'now ignored' : 'already ignored'})`);
   io.out(`  event cache: outside the repo, purged after ${workspace.config.cacheRetentionDays} days`);
