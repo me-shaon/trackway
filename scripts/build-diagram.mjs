@@ -132,7 +132,7 @@ function draw(c) {
   ${elbow(mid, 176, leftX + laneW / 2, laneY - 4, c)}
   ${elbow(mid, 176, rightX + laneW / 2, laneY - 4, c)}
 
-  ${panel({ x: leftX, y: laneY, w: laneW, h: laneH, title: 'Harvest recorded forks', sub: 'verbatim from the session, no model call', c, accent: c.sure })}
+  ${panel({ x: leftX, y: laneY, w: laneW, h: laneH, title: 'Copy the options you were offered', sub: 'verbatim from the session, no model call', c, accent: c.sure })}
   ${panel({ x: rightX, y: laneY, w: laneW, h: laneH, title: 'Distil the rest', sub: 'your own agent, headless', c })}
 
   <text x="${leftX + laneW / 2}" y="${laneY + laneH + 20}" text-anchor="middle"

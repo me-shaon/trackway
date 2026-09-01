@@ -54,7 +54,7 @@
     <path d="M63 223 v60" stroke="#3f9a7c" stroke-width="3" stroke-linecap="round"/>
     <text x="221" y="240" text-anchor="middle"
           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14.5"
-          font-weight="600" fill="#22262c">Harvest recorded forks</text>
+          font-weight="600" fill="#22262c">Copy the options you were offered</text>
     <text x="221" y="260" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
                  font-size="11.5" fill="#6a7179">verbatim from the session, no model call</text>
   </g>

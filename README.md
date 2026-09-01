@@ -71,7 +71,7 @@ Coding agents write every session to disk as they go. Trackway reads those files
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/me-shaon/trackway/main/docs/pipeline-dark.svg">
     <img
-      alt="The Trackway pipeline. Agent session files, written to disk by the agent as you work — nothing is hooked, you keep working normally. Those are parsed, with model reasoning stripped and credentials redacted. Extraction then splits in two: recorded forks are harvested verbatim from the session with no model call, which is deterministic, and everything else is distilled by your own agent running headless, which is model-extracted. Both feed .trackway/records/*.md, which is git-tracked and shows up in your diffs, and those records are read back through search, the explorer, and MCP retrieval."
+      alt="The Trackway pipeline. Agent session files, written to disk by the agent as you work — nothing is hooked, you keep working normally. Those are parsed, with model reasoning stripped and credentials redacted. Extraction then splits in two: the options you were offered are copied verbatim out of the session with no model call, which is deterministic, and everything else is distilled by your own agent running headless, which is model-extracted. Both feed .trackway/records/*.md, which is git-tracked and shows up in your diffs, and those records are read back through search, the explorer, and MCP retrieval."
       src="https://raw.githubusercontent.com/me-shaon/trackway/main/docs/pipeline-light.svg"
       width="880">
   </picture>
@@ -79,7 +79,7 @@ Coding agents write every session to disk as they go. Trackway reads those files
 
 Two paths produce records, and they are not equally reliable. Trackway is explicit about which one a record came from.
 
-**Harvested forks (deterministic).** When an agent presents you an explicit list of options, it stores the question, every option, and each option's rationale as structured tool input. Trackway reads that verbatim: no inference, no summarising, no model call. Every fork ends one of three ways, and each is recorded as what it actually was:
+**Options you were offered (deterministic).** When an agent presents you an explicit list of options, it stores the question, every option, and each option's rationale as structured tool input. Trackway reads that verbatim: no inference, no summarising, no model call. Every one of these ends one of three ways, and each is recorded as what it actually was:
 
 | You | Recorded as |
 | --- | --- |
@@ -138,7 +138,7 @@ trackway graph --no-open      # start the server and leave the browser alone
 It serves three views, and the screenshot at the top of this page is the second one:
 
 - **Story.** What happened on this project, grouped by topic, in the order it happened.
-- **Decisions.** Every fork, ordered by how many options it recorded, each with the branches nobody took.
+- **Decisions.** Every decision that came with a list of options, ordered by how many it recorded, each with the branches nobody took.
 - **Overview.** What the record holds and which topics are worth opening.
 
 All three share one rail of filters. Records are sorted into four kinds (*product*, *technical*, *your call*, and *working*), and only the first three are shown by default. On a real session that is 18 records out of 101.
@@ -213,7 +213,7 @@ OpenCode was meant to go through `opencode export --sanitize`, which returns alr
 
 ## Any other agent
 
-Each adapter above reads a store somebody else designed, so a new one waits on reverse-engineering a format *and* on owning a machine with that agent installed. `trackway ingest` needs neither, and it is how Cursor works today. Pipe it a transcript and it becomes records like any session found on disk: same distillation, same fork harvesting, same commit linking.
+Each adapter above reads a store somebody else designed, so a new one waits on reverse-engineering a format *and* on owning a machine with that agent installed. `trackway ingest` needs neither, and it is how Cursor works today. Pipe it a transcript and it becomes records like any session found on disk: same distillation, the same option lists read verbatim, same commit linking.
 
 ```bash
 cat chat.json | trackway ingest
@@ -257,7 +257,7 @@ A transcript does not have to settle for model extraction. Name a tool entry `As
 }
 ```
 
-That produces a decision carrying the option taken and both rejected ones with their reasons, on the same three-way rule as any other fork: an answer naming none of the options becomes a decision the developer authored, and a dismissed question stays a question.
+That produces a decision carrying the option taken and both rejected ones with their reasons, on the same three-way rule as any other list of options: an answer naming none of the options becomes a decision the developer authored, and a dismissed question stays a question.
 
 ## For agents
 
@@ -277,7 +277,7 @@ The server exposes no write tool. Records are created by distillation only.
 
 Two paths, measured separately. Averaging them would flatter the tool.
 
-**Fork harvesting is deterministic.** It reads what the session recorded, verbatim. There is nothing to be accurate about.
+**Reading the options you were offered is deterministic.** It copies what the session recorded, verbatim. There is nothing to be accurate about.
 
 **Distillation is model-extracted and imperfect.**
 

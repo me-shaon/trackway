@@ -4,7 +4,7 @@ import { FirstRun, plural } from './Timeline.js';
 import type { DecisionRecord, Forge, MemoryRecord } from '../types.js';
 
 /**
- * Every fork, richest first.
+ * Every decision that came with a list of options, richest first.
  *
  * This used to be a two-pane picker with its own page shape, which made the
  * application look like three unrelated products. It renders the same rows as

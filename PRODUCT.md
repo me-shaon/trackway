@@ -40,7 +40,7 @@ Five record types: question, discovery, decision, action, outcome. Every record 
 
 Records carry a significance: business, technical, direction, or working. The default view shows the first three. On a real session that is 18 of 101 records.
 
-Decisions carry the options not taken, each with its own reason, harvested from the option lists a session recorded verbatim.
+Decisions carry the options not taken, each with its own reason, copied verbatim from the option lists a session recorded.
 
 Everything is local. No account, no hosted backend, no telemetry. Model reasoning is stripped and credentials are redacted before anything reaches disk; redaction is best-effort and documented as such.
 

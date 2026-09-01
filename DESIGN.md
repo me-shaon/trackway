@@ -194,7 +194,7 @@ The four significance kinds as real checkboxes in the rail: a 16px box that fill
 
 Rows are 44px tall. Below 820px they lay out two-up.
 
-### Options (the fork)
+### Options (the list you were offered)
 
 An 18px mark column and the content beside it. Taken: a drawn check in the record's own fringe colour, label at 500 in primary ink. Not taken: a drawn cross in tertiary ink, label at 400 in secondary ink. The two groups are separated by a hairline and an uppercase mono "Not taken".
 
