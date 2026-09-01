@@ -67,21 +67,15 @@ It fits best if you work with an agent for months on a codebase you will still b
 
 Coding agents write every session to disk as they go. Trackway reads those files. It does not hook into your agent, sit between you and your model, or capture anything live.
 
-```
-agent session files          you keep working normally
-        |
-        v
-    parse, strip model reasoning, redact credentials
-        |
-        v
-    harvest recorded forks  ──┐
-    distil the rest          ─┤
-                              v
-                    .trackway/records/*.md   ← git-tracked, in your diffs
-                              |
-                              v
-              search · explorer · MCP retrieval
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/me-shaon/trackway/main/docs/pipeline-dark.svg">
+    <img
+      alt="The Trackway pipeline. Agent session files, written to disk by the agent as you work — nothing is hooked, you keep working normally. Those are parsed, with model reasoning stripped and credentials redacted. Extraction then splits in two: recorded forks are harvested verbatim from the session with no model call, which is deterministic, and everything else is distilled by your own agent running headless, which is model-extracted. Both feed .trackway/records/*.md, which is git-tracked and shows up in your diffs, and those records are read back through search, the explorer, and MCP retrieval."
+      src="https://raw.githubusercontent.com/me-shaon/trackway/main/docs/pipeline-light.svg"
+      width="880">
+  </picture>
+</p>
 
 Two paths produce records, and they are not equally reliable. Trackway is explicit about which one a record came from.
 

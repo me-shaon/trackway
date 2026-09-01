@@ -15,6 +15,7 @@
     "test:watch": "vitest",
     "build:package": "npm run build && node scripts/build-package.mjs",
     "verify:package": "node scripts/verify-package.mjs",
+    "diagram": "node scripts/build-diagram.mjs",
     "release": "npm run build:package && npm run verify:package && npm publish packages/cli/npm"
   },
   "devDependencies": {

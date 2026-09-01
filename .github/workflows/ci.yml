@@ -62,3 +62,15 @@ jobs:
             git diff --stat -- packages/ui/dist
             exit 1
           fi
+
+      # The README's diagram is drawn by a script into one file per theme. Two
+      # copies of the same drawing drift, and the one that drifts is the one
+      # fewer people look at.
+      - name: The README diagram matches its script
+        run: |
+          npm run diagram
+          if ! git diff --quiet -- docs; then
+            echo "::error::docs/pipeline-*.svg is stale. Run 'npm run diagram' and commit the result."
+            git diff --stat -- docs
+            exit 1
+          fi
