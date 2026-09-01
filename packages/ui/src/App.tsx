@@ -93,6 +93,11 @@ function ThemeChoice(): ReactElement {
         className="theme-btn"
         aria-haspopup="menu"
         aria-expanded={open}
+        // A button's accessible name is whatever is inside it, so on its own
+        // this announced as "System" with no clue what it controls. The select
+        // this replaced carried the purpose separately from the value; both
+        // belong in the name here.
+        aria-label={`Colour theme: ${THEME_LABEL[theme]}`}
         onClick={() => setOpen((was) => !was)}
         onKeyDown={(event) => {
           if (open && event.key === 'Escape') setOpen(false);
