@@ -4,17 +4,29 @@ import type { DistillRunner } from './runner/contract.js';
 import { extractJsonObject } from './runner/validate.js';
 import { triageDiscoveries } from './triage.js';
 
-const Organization = z.strictObject({
-  episodes: z.array(
-    z.strictObject({
-      id: z.string().min(1),
-      title: z.string().min(1),
-      recordIndexes: z.array(z.number().int().min(0)),
-    }),
-  ),
-  significance: z
-    .record(z.string(), z.enum(['business', 'technical', 'direction', 'working']))
-    .default({}),
+const SIGNIFICANCE = ['business', 'technical', 'direction', 'working'] as const;
+
+type Significance = (typeof SIGNIFICANCE)[number];
+
+const EpisodeShape = z.strictObject({
+  id: z.string().min(1),
+  title: z.string().min(1),
+  recordIndexes: z.array(z.number().int().min(0)),
+});
+
+/**
+ * Loose on purpose, and validated item by item below.
+ *
+ * The strict version threw the whole answer away over one cell: a session of
+ * 132 records came back with 131 good classifications and one word that is not
+ * one of the four, and every topic in it was discarded. The call is already
+ * paid for by then, and the run after it asks the same question and rolls the
+ * same dice. Take what parses, drop what does not, and say how much was
+ * dropped.
+ */
+const Organization = z.object({
+  episodes: z.array(z.unknown()).default([]),
+  significance: z.record(z.string(), z.unknown()).default({}),
 });
 
 export interface Episode {
@@ -26,6 +38,18 @@ export interface Episode {
 export interface OrganizeResult {
   records: MemoryRecord[];
   episodes: Episode[];
+}
+
+export interface OrganizeOptions {
+  /**
+   * Told when a call came back unusable.
+   *
+   * A call that produces nothing looks, from the outside, exactly like a
+   * session that had nothing to group: every record keeps a null topic either
+   * way. One of those cost a model call and is worth knowing about, so the
+   * difference is reported rather than swallowed.
+   */
+  onProblem?: (reason: string) => void;
 }
 
 /**
@@ -40,6 +64,7 @@ export interface OrganizeResult {
 export async function organizeSession(
   runner: DistillRunner,
   records: readonly MemoryRecord[],
+  options: OrganizeOptions = {},
 ): Promise<OrganizeResult> {
   if (records.length === 0) return { records: [], episodes: [] };
 
@@ -49,17 +74,40 @@ export async function organizeSession(
   try {
     parsed = extractJsonObject(output);
   } catch {
+    options.onProblem?.('grouping: the model returned no JSON object');
     return { records: [...records], episodes: [] };
   }
 
   const result = Organization.safeParse(parsed);
-  if (!result.success) return { records: [...records], episodes: [] };
+  if (!result.success) {
+    options.onProblem?.('grouping: the model returned JSON with no topics or classifications in it');
+    return { records: [...records], episodes: [] };
+  }
 
-  const assigned = result.data.significance;
+  const proposed = result.data.episodes
+    .map((episode) => EpisodeShape.safeParse(episode))
+    .filter((parse) => parse.success)
+    .map((parse) => parse.data);
+
+  const malformed = result.data.episodes.length - proposed.length;
+  if (malformed > 0) {
+    options.onProblem?.(`grouping: ${malformed} topic(s) came back malformed and were dropped`);
+  }
+
+  // A classification that is not one of the four is no classification. Dropping
+  // the cell leaves that record at whatever the extraction pass decided, which
+  // is the same place it would have been had the model said nothing.
+  const assigned: Record<string, Significance> = {};
+  for (const [index, value] of Object.entries(result.data.significance)) {
+    if (typeof value === 'string' && (SIGNIFICANCE as readonly string[]).includes(value)) {
+      assigned[index] = value as Significance;
+    }
+  }
+
   const episodeOf = new Map<number, string>();
   const episodes: Episode[] = [];
 
-  for (const episode of result.data.episodes) {
+  for (const episode of proposed) {
     const ids: string[] = [];
 
     for (const index of episode.recordIndexes) {
@@ -86,7 +134,7 @@ export async function organizeSession(
    * above it was ignored twice, keeping 27 of 27 discoveries including both
    * halves of two duplicate bug reports. Asked on its own it separates them.
    */
-  const triaged = await triageDiscoveries(runner, updated);
+  const triaged = await triageDiscoveries(runner, updated, options);
 
   return { records: triaged, episodes };
 }

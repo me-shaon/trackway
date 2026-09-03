@@ -23,6 +23,7 @@ const Verdict = z.strictObject({ own: z.array(z.number().int().min(0)).default([
 export async function triageDiscoveries(
   runner: DistillRunner,
   records: readonly MemoryRecord[],
+  options: { onProblem?: (reason: string) => void } = {},
 ): Promise<MemoryRecord[]> {
   const discoveries = records.filter((record) => record.type === 'discovery');
   if (discoveries.length === 0) return [...records];
@@ -36,11 +37,15 @@ export async function triageDiscoveries(
   try {
     verdict = extractJsonObject(await runner.run(buildTriagePrompt(discoveries)));
   } catch {
+    options.onProblem?.('discovery triage: the model returned no JSON object');
     return [...records];
   }
 
   const parsed = Verdict.safeParse(verdict);
-  if (!parsed.success) return [...records];
+  if (!parsed.success) {
+    options.onProblem?.('discovery triage: the model returned JSON of the wrong shape');
+    return [...records];
+  }
 
   // Anything out of range is dropped rather than trusted, so a bad answer can
   // only leave records visible, never hide ones it never judged.
