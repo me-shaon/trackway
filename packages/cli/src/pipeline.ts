@@ -31,14 +31,38 @@ import {
 import { isolate } from '@trackway/core';
 import { join } from 'node:path';
 import { acquireSyncLock } from './lock.js';
+import { loadGroupingState, stampGrouping } from './grouping-state.js';
 import { recordSweep, sweepIsDue } from './schedule.js';
 import { openWorkspaceIndex, type Workspace } from './workspace.js';
+
+/**
+ * What a sync is doing, sweep or otherwise.
+ *
+ * Grouping runs after the sweep and outside it, so its progress cannot come
+ * from `SweepProgress`. It still has to be reported: a phase that spends model
+ * calls behind a silent terminal is the same hang from the outside, and it is
+ * the one that follows "Nothing to sync".
+ */
+export type SyncProgress =
+  | SweepProgress
+  /** Grouping is about to start on this many sessions whose records have no topics. */
+  | { phase: 'grouping-planned'; total: number }
+  /** One session is being grouped into topics. */
+  | { phase: 'grouping'; index: number; total: number; sessionId: string };
 
 export interface SyncResult {
   sweep: SweepResult;
   written: number;
   skippedExisting: number;
   purgedCacheFiles: number;
+  /**
+   * Sessions whose grouping call came back unusable.
+   *
+   * Not a failure of the sync, and not nothing either: the call was paid for
+   * and the records still have no topic. Reported so a repository that never
+   * grows a topic list has something to explain it.
+   */
+  groupingProblems: string[];
   /**
    * What went wrong at a level that stopped the sync, rather than one session.
    *
@@ -61,7 +85,7 @@ export interface SyncOptions {
   /** Model calls this run may make. Cost scales with calls, so this is the real limit. */
   maxCalls?: number;
   now?: Date;
-  onProgress?: (event: SweepProgress) => void;
+  onProgress?: (event: SyncProgress) => void;
   /**
    * Run only if the configured interval has passed. The hook sets this; a
    * person typing `trackway sync` does not, because they asked for it now.
@@ -75,6 +99,7 @@ function empty(): SyncResult {
     written: 0,
     skippedExisting: 0,
     purgedCacheFiles: 0,
+    groupingProblems: [],
     errors: [],
     spend: emptyUsage(),
     calls: 0,
@@ -180,6 +205,14 @@ async function runSync(workspace: Workspace, options: SyncOptions): Promise<Sync
   let written = 0;
   let skipped = 0;
 
+  // Collected rather than logged and forgotten. A grouping call that comes back
+  // unusable leaves every record in that session topicless, which is exactly
+  // what a session with nothing worth grouping looks like.
+  const groupingProblems: string[] = [];
+  const onProblem = (reason: string): void => {
+    groupingProblems.push(reason);
+  };
+
   const sweep = await runSweep(registry, distill, {
     cacheDir: workspace.cacheDir,
     quietWindowMinutes: workspace.config.quietWindowMinutes,
@@ -219,10 +252,14 @@ async function runSync(workspace: Workspace, options: SyncOptions): Promise<Sync
 
       if (session.partial === undefined && !session.incomplete && affordable) {
         if (callBudget) callBudget.remaining -= CALLS_PER_GROUPING;
-        await isolate(() => group(workspace, metered, session.sessionId), undefined, {
-          operation: 'organize',
-          logPath: join(workspace.cacheDir, 'failures.log'),
-        });
+        await isolate(
+          () => group(workspace, metered, session.sessionId, { onProblem }),
+          undefined,
+          {
+            operation: 'organize',
+            logPath: join(workspace.cacheDir, 'failures.log'),
+          },
+        );
       }
     },
   });
@@ -231,10 +268,19 @@ async function runSync(workspace: Workspace, options: SyncOptions): Promise<Sync
   // it, would otherwise stay ungrouped forever: their sessions are finished, so
   // no future sweep will look at them again. Catching up here is the same
   // self-heal every read command already does for distillation.
-  await isolate(() => catchUpGrouping(workspace, metered, callBudget), undefined, {
-    operation: 'organize',
-    logPath: join(workspace.cacheDir, 'failures.log'),
-  });
+  await isolate(
+    () =>
+      catchUpGrouping(workspace, metered, callBudget, {
+        maxSessions: options.maxSessions ?? CATCH_UP_SESSIONS,
+        onProblem,
+        ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+      }),
+    undefined,
+    {
+      operation: 'organize',
+      logPath: join(workspace.cacheDir, 'failures.log'),
+    },
+  );
 
   const purge = await purgeCache(
     workspace.cacheDir,
@@ -247,6 +293,7 @@ async function runSync(workspace: Workspace, options: SyncOptions): Promise<Sync
     written,
     skippedExisting: skipped,
     purgedCacheFiles: purge.purged,
+    groupingProblems,
     errors: [],
     spend,
     calls,
@@ -367,6 +414,13 @@ export async function ingestTranscript(
  */
 const WORTH_GROUPING = 3;
 
+export interface GroupOptions {
+  /** Records already read by the caller, so one read serves a whole catch-up pass. */
+  records?: readonly MemoryRecord[];
+  /** Told when a grouping call was paid for and came back unusable. */
+  onProblem?: (reason: string) => void;
+}
+
 /**
  * Groups one session's records into topics and settles how important each is.
  *
@@ -381,8 +435,11 @@ export async function group(
   workspace: Workspace,
   runner: Parameters<typeof organizeSession>[0],
   sessionId: string,
+  options: GroupOptions = {},
 ): Promise<void> {
-  const { records } = await readAllRecords(workspace.recordsDir);
+  // The catch-up pass has just read every record to decide what to group, so it
+  // hands them over rather than making each session read the whole store again.
+  const records = options.records ?? (await readAllRecords(workspace.recordsDir)).records;
   const mine = records.filter((record) => record.sessionId === sessionId);
 
   if (mine.length < WORTH_GROUPING) return;
@@ -393,7 +450,16 @@ export async function group(
   const ungrouped = mine.filter((record) => record.episodeId === null);
   if (ungrouped.length < WORTH_GROUPING) return;
 
-  const organized = await organizeSession(runner, mine);
+  const organized = await organizeSession(runner, mine, {
+    onProblem: (reason) => options.onProblem?.(`${sessionId.slice(0, 8)}: ${reason}`),
+  });
+
+  // Stamped on the attempt, not on success. The model does not always place
+  // every record, and the handful it leaves behind are enough to make a session
+  // look ungrouped for good: without this, the same session was regrouped on
+  // every run for as long as the repository existed.
+  await stampGrouping(workspace.cacheDir, sessionId, mine.length);
+
   if (organized.episodes.length === 0) return;
 
   // The model numbers topics from one for every session it sees, so the ids
@@ -426,18 +492,33 @@ export async function group(
 const CALLS_PER_GROUPING = 2;
 
 /**
+ * Sessions the catch-up pass will group in one run when no session cap is given.
+ *
+ * Every read command sweeps as a self-heal, so this bounds a `search` as well
+ * as a `sync`. Five sessions is a bounded wait rather than an open-ended one,
+ * and the backlog clears over the runs that follow.
+ */
+const CATCH_UP_SESSIONS = 5;
+
+/**
  * Groups sessions whose records were written before anything grouped them.
  *
  * Bounded by the same budget as everything else, and it takes the smallest
  * sessions first: grouping is priced per record, so the cheapest ones clear the
  * backlog fastest and a single enormous session cannot eat a whole run.
  */
-async function catchUpGrouping(
+export async function catchUpGrouping(
   workspace: Workspace,
   runner: Parameters<typeof organizeSession>[0],
   budget: { remaining: number } | undefined,
+  options: {
+    maxSessions: number;
+    onProblem?: (reason: string) => void;
+    onProgress?: (event: SyncProgress) => void;
+  },
 ): Promise<void> {
   const { records } = await readAllRecords(workspace.recordsDir);
+  const grouped = await loadGroupingState(workspace.cacheDir);
 
   const bySession = new Map<string, number>();
   const ungrouped = new Set<string>();
@@ -449,12 +530,32 @@ async function catchUpGrouping(
 
   const candidates = [...ungrouped]
     .filter((id) => (bySession.get(id) ?? 0) >= WORTH_GROUPING)
-    .sort((a, b) => (bySession.get(a) ?? 0) - (bySession.get(b) ?? 0));
+    // Nothing new since the last grouping means the same question with the same
+    // input, and the same answer is already on disk.
+    .filter((id) => (bySession.get(id) ?? 0) > (grouped.sessions[id]?.records ?? -1))
+    .sort((a, b) => (bySession.get(a) ?? 0) - (bySession.get(b) ?? 0))
+    // Capped per run for the same reason the sweep is. A repository with a
+    // year of history behind it has a backlog measured in hours of model calls,
+    // and a command nobody can wait out is a command people kill. The pass is
+    // idempotent, so what is left is picked up by the next run.
+    .slice(0, Math.max(0, options.maxSessions));
+
+  if (candidates.length === 0) return;
+
+  options.onProgress?.({ phase: 'grouping-planned', total: candidates.length });
+
+  let index = 0;
 
   for (const sessionId of candidates) {
     if (budget && budget.remaining < CALLS_PER_GROUPING) return;
     if (budget) budget.remaining -= CALLS_PER_GROUPING;
 
-    await group(workspace, runner, sessionId);
+    index += 1;
+    options.onProgress?.({ phase: 'grouping', index, total: candidates.length, sessionId });
+
+    await group(workspace, runner, sessionId, {
+      records,
+      ...(options.onProblem === undefined ? {} : { onProblem: options.onProblem }),
+    });
   }
 }

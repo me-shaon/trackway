@@ -31,7 +31,7 @@ import {
   isGitHookInstalled,
   isHookInstalled,
 } from '../hook.js';
-import { ingestTranscript, sync } from '../pipeline.js';
+import { ingestTranscript, sync, type SyncProgress } from '../pipeline.js';
 import {
   createProgress,
   formatDuration,
@@ -104,7 +104,7 @@ function describeOutcome(event: SweepProgress & { phase: 'done' }): string {
 }
 
 export interface SweepReporter {
-  report: (event: SweepProgress) => void;
+  report: (event: SyncProgress) => void;
   /** Ends the animation and leaves the line clean. Safe to call twice. */
   finish: () => void;
 }
@@ -125,7 +125,7 @@ export function sweepReporter(io: Io, options: ProgressOptions = {}): SweepRepor
   let completed = 0;
 
   const show = (
-    event: Exclude<SweepProgress, { phase: 'planned' }>,
+    event: { index: number; total: number; sessionId: string },
     activity: string,
   ): void => {
     total = event.total;
@@ -152,6 +152,24 @@ export function sweepReporter(io: Io, options: ProgressOptions = {}): SweepRepor
         io.out(
           `${event.eligible} session(s) to sync${deferred}. Each one is several model calls, so this takes minutes rather than seconds.`,
         );
+        return;
+      }
+
+      // Grouping runs after the sweep, so its counts start again from zero.
+      // Without this the bar would carry the sweep's totals into a phase they
+      // say nothing about.
+      if (event.phase === 'grouping-planned') {
+        completed = 0;
+        total = event.total;
+        io.out(
+          `Grouping ${event.total} session(s) whose records have no topics yet. Each is a couple of model calls.`,
+        );
+        return;
+      }
+
+      if (event.phase === 'grouping') {
+        completed = event.index - 1;
+        show(event, 'grouping into topics');
         return;
       }
 
@@ -415,6 +433,18 @@ export async function syncCommand(
 
   for (const failure of result.sweep.failures) {
     io.err(`  failed: ${failure.sessionId.slice(0, 12)}: ${truncate(failure.reason, 90)}`);
+  }
+
+  // A grouping call that came back unusable spent money and changed nothing,
+  // and the result on disk is identical to a session that had nothing worth
+  // grouping. Saying so is the difference between a quirk and a bug report.
+  if (result.groupingProblems.length > 0) {
+    io.err(
+      `  grouping:    ${result.groupingProblems.length} call(s) came back unusable; those records kept no topics`,
+    );
+    for (const problem of result.groupingProblems.slice(0, 3)) {
+      io.err(`    ${truncate(problem, 100)}`);
+    }
   }
 
   // The sync itself fell over rather than one session in it. Without this the

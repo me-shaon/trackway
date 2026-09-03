@@ -27,6 +27,7 @@ import {
   sessionsCommand,
   sweepReporter,
   syncCommand,
+  catchUpGrouping,
   acquireSyncLock,
   installGitHook,
   isGitHookInstalled,
@@ -939,6 +940,136 @@ describe('the progress line on a terminal', () => {
     reporter.finish();
 
     expect(io.statuses).toContain('');
+  });
+});
+
+describe('grouping records into topics after the sweep', () => {
+  /*
+   * Grouping runs after the sweep and outside it, so it emitted no progress at
+   * all. A sync over a repository with nothing new printed "Nothing to sync"
+   * and then sat there spending model calls behind a silent terminal, which is
+   * a hang as far as anyone watching can tell.
+   */
+  function ungroupedSession(sessionId: string, count: number): MemoryRecord[] {
+    return Array.from({ length: count }, (_, index) =>
+      decisionRecord({
+        id: `dec-20260825-${sessionId}${index}`,
+        sessionId,
+        episodeId: null,
+        source: {
+          adapter: 'claude-code',
+          sessionId,
+          sessionFile: `/tmp/${sessionId}.jsonl`,
+          fromOffset: 0,
+          toOffset: 12,
+        },
+      }),
+    );
+  }
+
+  function countingRunner(output: string) {
+    const prompts: string[] = [];
+    return {
+      prompts,
+      id: 'fake',
+      isAvailable: async () => ({ available: true }),
+      run: async (prompt: string) => {
+        prompts.push(prompt);
+        return output;
+      },
+    };
+  }
+
+  it('announces the backlog before spending calls on it', () => {
+    const io = captureIo();
+
+    sweepReporter(io).report({ phase: 'grouping-planned', total: 3 });
+
+    expect(io.lines.join(' ')).toContain('Grouping 3 session(s)');
+  });
+
+  it('keeps the status line moving while a session is grouped', () => {
+    const io = captureIo();
+
+    sweepReporter(io).report({
+      phase: 'grouping',
+      index: 2,
+      total: 3,
+      sessionId: 'abcdef0123456789',
+    });
+
+    expect(io.statuses.join(' ')).toContain('[2/3] abcdef01');
+    expect(io.statuses.join(' ')).toContain('grouping into topics');
+  });
+
+  it('groups no more sessions in one run than it was allowed', async () => {
+    const workspace = await loadWorkspace(repo);
+    for (const id of ['ses-a', 'ses-b', 'ses-c', 'ses-d']) {
+      await persist(workspace!, ungroupedSession(id, 3));
+    }
+
+    const runner = countingRunner('nothing usable here');
+    const events: string[] = [];
+
+    await catchUpGrouping(workspace!, runner, undefined, {
+      maxSessions: 2,
+      onProgress: (event) => events.push(event.phase),
+    });
+
+    // One call per session, and no fifth one: a year of history is hours of
+    // calls, and what is left over is picked up by the next run.
+    expect(runner.prompts).toHaveLength(2);
+    expect(events).toEqual(['grouping-planned', 'grouping', 'grouping']);
+  });
+
+  it('does not group the same records twice, however many the model left over', async () => {
+    const workspace = await loadWorkspace(repo);
+    await persist(workspace!, ungroupedSession('ses-a', 3));
+
+    const runner = countingRunner('sorry, no');
+    const options = { maxSessions: 5 };
+
+    await catchUpGrouping(workspace!, runner, undefined, options);
+    await catchUpGrouping(workspace!, runner, undefined, options);
+
+    // Grouping does not always place every record, and the handful it leaves
+    // behind used to make the session look ungrouped on every later run: the
+    // same call, the same answer, the same money, for as long as the
+    // repository existed.
+    expect(runner.prompts).toHaveLength(1);
+  });
+
+  it('groups a session again once it has records the last grouping never saw', async () => {
+    const workspace = await loadWorkspace(repo);
+    await persist(workspace!, ungroupedSession('ses-a', 3));
+
+    const runner = countingRunner('sorry, no');
+    const options = { maxSessions: 5 };
+
+    await catchUpGrouping(workspace!, runner, undefined, options);
+    await persist(workspace!, ungroupedSession('ses-a-more', 3).map((record) => ({
+      ...record,
+      sessionId: 'ses-a',
+    })));
+    await catchUpGrouping(workspace!, runner, undefined, options);
+
+    expect(runner.prompts).toHaveLength(2);
+  });
+
+  it('reports a grouping call that came back unusable rather than swallowing it', async () => {
+    const workspace = await loadWorkspace(repo);
+    await persist(workspace!, ungroupedSession('ses-a', 3));
+
+    const problems: string[] = [];
+    await catchUpGrouping(workspace!, countingRunner('sorry, no'), undefined, {
+      maxSessions: 5,
+      onProblem: (reason) => problems.push(reason),
+    });
+
+    // Otherwise this is indistinguishable from a session with nothing worth
+    // grouping: both leave every record with no topic and say nothing.
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('no JSON object');
   });
 });
 

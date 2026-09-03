@@ -3,6 +3,7 @@ export * from './hook.js';
 export * from './pipeline.js';
 export * from './lock.js';
 export * from './schedule.js';
+export * from './grouping-state.js';
 export * from './format.js';
 export * from './commands/index.js';
 export * from './commands/graph.js';
