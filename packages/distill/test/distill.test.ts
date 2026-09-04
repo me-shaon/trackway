@@ -154,6 +154,39 @@ describe('validating model output', () => {
     expect(decision?.type === 'decision' && decision.attribution.acceptedBy).toBe('implicit');
   });
 
+  /*
+   * A real session lost a whole region to this: one decision came back with an
+   * extra field inside its attribution, a strict schema rejected the batch, and
+   * the region was reported incomplete and re-read at cost on the next sync,
+   * where the model was free to add the same field again.
+   */
+  it('keeps the batch when attribution carries a field beyond the two actors', () => {
+    const output = {
+      ...wellFormed,
+      decisions: [
+        {
+          ...wellFormed.decisions[0],
+          attribution: {
+            ...wellFormed.decisions[0]?.attribution,
+            acceptedAt: '2026-09-04T10:00:00Z',
+          },
+        },
+      ],
+    };
+
+    const decision = toRecords(JSON.stringify(output), provenance).find(
+      (r) => r.type === 'decision',
+    );
+
+    expect(decision?.type === 'decision' && decision.choice).toBe('Redis');
+    // Dropped rather than stored. A record still carries only what the schema
+    // names, so this changes what is rejected and not what is kept.
+    expect(decision?.type === 'decision' && Object.keys(decision.attribution)).toEqual([
+      'proposedBy',
+      'acceptedBy',
+    ]);
+  });
+
   it('accepts a response where every array is empty', () => {
     const records = toRecords(
       JSON.stringify({ questions: [], discoveries: [], decisions: [], actions: [], outcomes: [] }),

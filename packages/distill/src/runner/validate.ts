@@ -63,7 +63,20 @@ const RawProposer = z
   ])
   .catch({ type: 'agent' as const, id: 'unknown' });
 
-const RawAttribution = z.strictObject({
+/**
+ * The one envelope that drops keys it does not know rather than rejecting.
+ *
+ * A record carrying an invented field is rejected everywhere else in this file,
+ * and that is on purpose: a model inventing fields is inventing content. This
+ * envelope is different. It holds two references to who did what, both of which
+ * already fall back rather than fail, and a model that adds "acceptedAt" beside
+ * them has said nothing untrue about the decision.
+ *
+ * Measured on a real session: one such field cost the whole chunk, which was
+ * reported as a region that could not be read and was re-read and paid for on
+ * the next sync, where the same model was free to add the same field again.
+ */
+const RawAttribution = z.object({
   proposedBy: RawProposer,
   acceptedBy: RawAcceptance,
 });
