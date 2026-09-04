@@ -398,7 +398,11 @@ export async function syncCommand(
   // never says how much is one people stop running.
   if (result.calls > 0) {
     const { spend } = result;
-    const cost = spend.costUsd > 0 ? `, $${spend.costUsd.toFixed(3)}` : '';
+    // The agent reports this, Trackway does not price anything itself, and what
+    // it reports is the API list price for the tokens. On a subscription plan
+    // no money moves per call, so the number is what the work would cost at API
+    // rates rather than a charge. Saying which keeps it from reading as a bill.
+    const cost = spend.costUsd > 0 ? `, $${spend.costUsd.toFixed(3)} at API rates` : '';
     io.out(
       `  spent:       ${result.calls} model call(s), ${formatTokens(spend.inputTokens)} in / ${formatTokens(spend.outputTokens)} out${cost}`,
     );
@@ -427,7 +431,10 @@ export async function syncCommand(
     // is the state this whole change exists to get out of.
     for (const session of partial.slice(0, 3)) {
       const reason = session.partialReasons?.[0];
-      if (reason) io.err(`    ${session.sessionId.slice(0, 12)}: ${truncate(reason, 90)}`);
+      // Wide enough to keep the part that says what was wrong. At 90 the
+      // schema path arrived and the field name it was complaining about did
+      // not, which is the half worth reading.
+      if (reason) io.err(`    ${session.sessionId.slice(0, 12)}: ${truncate(reason, 160)}`);
     }
   }
 
