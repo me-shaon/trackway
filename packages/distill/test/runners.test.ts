@@ -181,6 +181,26 @@ describe('falling back to whichever agent this machine has', () => {
     expect(secondAsked).toBe(false);
   });
 
+  /*
+   * A limit that is spent is spent for hours, and a sweep runs for minutes. It
+   * was reported as an ordinary exit, so nothing struck the runner off and a
+   * sync of 802 sessions asked an exhausted account three times per chunk for
+   * every one of them.
+   */
+  it('treats a spent usage limit as fatal', () => {
+    const limit = new RunnerError('claude-code', 'exit', 'exited with code 1: 429 Claude AI usage limit reached|1757');
+    const rate = new RunnerError('claude-code', 'exit', 'exited with code 1: rate limit exceeded');
+
+    expect(isFatal(limit)).toBe(true);
+    expect(isFatal(rate)).toBe(true);
+  });
+
+  // The message an unusable runner produced is the only thing that says why,
+  // and a blank one used to match nothing at all.
+  it('does not guess at a failure that said nothing', () => {
+    expect(isFatal(new RunnerError('claude-code', 'exit', 'exited with code 1: '))).toBe(false);
+  });
+
   it('offers every shipped agent, Claude first because its call is cheapest', () => {
     expect(defaultRunners().map((runner) => runner.id)).toEqual(['claude-code', 'codex', 'opencode']);
   });

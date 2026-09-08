@@ -1,5 +1,8 @@
 import { withDerivedId, type MemoryEvent, type SessionDescriptor } from '@trackway/core';
-import { describe, expect, it } from 'vitest';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
   ClaudeDistillRunner,
   EXTRACTION_INSTRUCTIONS,
@@ -12,6 +15,7 @@ import {
   extractJsonObject,
   partialFailures,
   partialReasons,
+  runnerGoneReason,
   renderTranscript,
   toRecords,
   type DistillRunner,
@@ -185,6 +189,38 @@ describe('validating model output', () => {
       'proposedBy',
       'acceptedBy',
     ]);
+  });
+
+  /*
+   * A real sync reported `outcomes.2.result: Invalid option` on a session that
+   * kept 7 records and lost the rest of that region to it. The field is a
+   * label, not content, and the model writes it in whatever word fits: the
+   * empty string was already tolerated here for exactly this reason.
+   */
+  it('reads an outcome labelled in the model\'s own words', () => {
+    const output = {
+      ...wellFormed,
+      outcomes: [
+        { text: 'The suite is green.', result: 'success' },
+        { text: 'The deploy blew up.', result: 'error' },
+        { text: 'Still looking into it.', result: 'pending' },
+        { text: 'Nobody said.', result: '' },
+      ],
+    };
+
+    const labels = toRecords(JSON.stringify(output), provenance)
+      .filter((record) => record.type === 'outcome')
+      .map((record) => (record.type === 'outcome' ? record.result : undefined));
+
+    expect(labels).toEqual(['passed', 'failed', 'unresolved', 'unresolved']);
+  });
+
+  // Only words that mean one of the three. A label nobody can read is the model
+  // getting the shape wrong, which this file rejects the batch over on purpose.
+  it('rejects a label that means nothing', () => {
+    const output = { ...wellFormed, outcomes: [{ text: 'Something happened.', result: 'banana' }] };
+
+    expect(() => toRecords(JSON.stringify(output), provenance)).toThrow(InvalidDistillationError);
   });
 
   it('accepts a response where every array is empty', () => {
@@ -472,6 +508,58 @@ describe('the distiller', () => {
     expect(JSON.stringify(decision)).toContain('Background daemon');
   });
 
+  /*
+   * The chain hands a fatal failure back once every runner is struck off, and
+   * retrying it spent three calls and four seconds per chunk to be told the
+   * same thing three times. On a sweep of 802 sessions that is the difference
+   * between stopping and grinding.
+   */
+  it('does not retry a failure that will repeat', async () => {
+    let asked = 0;
+    const spent: DistillRunner = {
+      id: 'stub',
+      async isAvailable() {
+        return { available: true };
+      },
+      async run() {
+        asked += 1;
+        throw new RunnerError('claude-code', 'exit', 'exited with code 1: 429 usage limit reached');
+      },
+    };
+
+    await expect(
+      createDistiller({ runner: spent, retryDelayMs: 0 })({
+        descriptor,
+        events: [eventAt(0, 'a')],
+        fromOffset: -1,
+      }),
+    ).rejects.toThrow(RunnerError);
+
+    expect(asked).toBe(1);
+  });
+
+  // Nothing about the session was wrong, so nothing should be counted against
+  // it and the sweep has no reason to keep going.
+  it('marks a runner that is gone, so the sweep stops rather than failing every session', async () => {
+    const gone: DistillRunner = {
+      id: 'stub',
+      async isAvailable() {
+        return { available: true };
+      },
+      async run() {
+        throw new RunnerError('claude-code', 'unavailable', 'every runner failed: claude-code');
+      },
+    };
+
+    const failure = await createDistiller({ runner: gone, retryDelayMs: 0 })({
+      descriptor,
+      events: [eventAt(0, 'a')],
+      fromOffset: -1,
+    }).catch((error: unknown) => error);
+
+    expect(runnerGoneReason(failure)).toContain('claude-code');
+  });
+
   it('propagates a runner failure', async () => {
     const failing: DistillRunner = {
       id: 'stub',
@@ -490,6 +578,56 @@ describe('the distiller', () => {
 });
 
 describe('the Claude runner', () => {
+  const agentDirs: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(agentDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  /** Stands in for the agent, so a failure shape can be tested without one. */
+  async function fakeAgent(script: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'trackway-agent-'));
+    agentDirs.push(dir);
+    const path = join(dir, 'agent.sh');
+    await writeFile(path, `#!/bin/sh\ncat > /dev/null\n${script}\n`, { mode: 0o755 });
+    return path;
+  }
+
+  /*
+   * The agent prints its result envelope on stdout and exits non-zero, leaving
+   * stderr empty. Reading only stderr turned every failed call into
+   * "exited with code 1:" with nothing after the colon, which is what a user
+   * saw 700 times in one sync with no way to tell what went wrong.
+   */
+  it('says what the agent said when the agent failed on stdout', async () => {
+    const envelope = JSON.stringify({
+      type: 'result',
+      is_error: true,
+      api_error_status: 400,
+      result: 'Prompt is too long · the request is ~425210 tokens (limit 200000)',
+    });
+    const runner = new ClaudeDistillRunner({ binary: await fakeAgent(`echo '${envelope}'\nexit 1`) });
+
+    await expect(runner.run('anything')).rejects.toThrow(/Prompt is too long/);
+  });
+
+  // The status is what tells an account problem apart from a bad request, and
+  // the chain strikes a runner off by reading exactly that.
+  it('keeps the status the agent reported', async () => {
+    const envelope = JSON.stringify({ is_error: true, api_error_status: 429, result: 'usage limit reached' });
+    const runner = new ClaudeDistillRunner({ binary: await fakeAgent(`echo '${envelope}'\nexit 1`) });
+
+    await expect(runner.run('anything')).rejects.toThrow(/429/);
+  });
+
+  it('falls back to stderr when stdout carried no envelope', async () => {
+    const runner = new ClaudeDistillRunner({
+      binary: await fakeAgent('echo "Error: Invalid JSON provided to --settings" >&2\nexit 1'),
+    });
+
+    await expect(runner.run('anything')).rejects.toThrow(/Invalid JSON provided/);
+  });
+
   it('reports unavailable when the binary does not exist', async () => {
     const runner = new ClaudeDistillRunner({ binary: 'definitely-not-a-real-binary-xyz' });
 

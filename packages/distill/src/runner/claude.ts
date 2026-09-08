@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
   RunnerError,
+  describeExit,
   distillEnv,
   type DistillRunner,
   type RunOptions,
@@ -218,11 +219,7 @@ export class ClaudeDistillRunner implements DistillRunner {
           if (code === 0) resolve(stdout.trim());
           else
             reject(
-              new RunnerError(
-                RUNNER_ID,
-                'exit',
-                `exited with code ${code}: ${stderr.trim().slice(0, 300)}`,
-              ),
+              new RunnerError(RUNNER_ID, 'exit', describeExit(code, stdout, stderr)),
             );
         });
       });

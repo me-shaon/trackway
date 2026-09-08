@@ -2,7 +2,13 @@ import { spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
-import { RunnerError, distillEnv, type DistillRunner, type RunOptions } from './contract.js';
+import {
+  RunnerError,
+  describeExit,
+  distillEnv,
+  type DistillRunner,
+  type RunOptions,
+} from './contract.js';
 import { runnerWorkingDir } from './claude.js';
 
 const RUNNER_ID = 'codex';
@@ -189,11 +195,7 @@ export class CodexDistillRunner implements DistillRunner {
           if (code === 0) resolve(stdout.trim());
           else
             reject(
-              new RunnerError(
-                RUNNER_ID,
-                'exit',
-                `exited with code ${code}: ${stderr.trim().slice(0, 300)}`,
-              ),
+              new RunnerError(RUNNER_ID, 'exit', describeExit(code, stdout, stderr)),
             );
         });
       });

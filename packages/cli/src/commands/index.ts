@@ -97,7 +97,11 @@ function describeOutcome(event: SweepProgress & { phase: 'done' }): string {
         ? `${event.records} record(s), ${truncate(event.reason, 70)}`
         : `${event.records} record(s), part of it could not be read`;
     case 'failed':
-      return `failed: ${truncate(event.reason ?? 'unknown', 80)}`;
+      // Wide enough to keep the part that says what went wrong. At 80 the
+      // schema path arrived and the value it was complaining about did not,
+      // which is the half worth reading. The line is clipped to the terminal
+      // width on the way out either way.
+      return `failed: ${truncate(event.reason ?? 'unknown', 160)}`;
     case 'skipped':
       return `skipped: ${truncate(event.reason ?? 'nothing worth extracting', 80)}`;
   }
@@ -412,6 +416,13 @@ export async function syncCommand(
     io.out(`  deferred:    ${result.sweep.deferred} (run again to continue)`);
   }
 
+  // The agent went unusable part way through. Without this the run reads as a
+  // sweep that mostly failed, when the sessions it never reached are untouched
+  // and a later run will do them.
+  if (result.sweep.stopped) {
+    io.err(`  stopped:     ${truncate(result.sweep.stopped, 120)}`);
+  }
+
   // A session read in several calls can lose one of them after retries. The
   // records that did come back are kept, and the region that failed is read
   // again next sweep rather than skipped in silence.
@@ -439,7 +450,7 @@ export async function syncCommand(
   }
 
   for (const failure of result.sweep.failures) {
-    io.err(`  failed: ${failure.sessionId.slice(0, 12)}: ${truncate(failure.reason, 90)}`);
+    io.err(`  failed: ${failure.sessionId.slice(0, 12)}: ${truncate(failure.reason, 160)}`);
   }
 
   // A grouping call that came back unusable spent money and changed nothing,

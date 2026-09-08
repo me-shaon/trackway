@@ -84,6 +84,63 @@ export interface RunOptions {
   signal?: AbortSignal;
 }
 
+/**
+ * What a non-zero exit was about.
+ *
+ * Every agent here prints its result envelope on stdout and keeps stderr for
+ * the process failing to start at all, so a call the agent itself refused exits
+ * non-zero with the reason on stdout and nothing on stderr. Reading only stderr
+ * turned all of those into "exited with code 1:" and a blank space: measured on
+ * a real machine, 700 sessions of one sync failed and not one line said why.
+ *
+ * The status code comes along when the envelope carries one. It is what tells
+ * a spent account apart from a request that was too large, and striking a
+ * runner off depends on reading exactly that.
+ */
+export function describeExit(code: number | null, stdout: string, stderr: string): string {
+  // Whatever the agent printed, wherever it printed it. An empty stderr is the
+  // usual case here, not the exception.
+  const said = agentReportedError(stdout) ?? (stderr.trim() || stdout.trim());
+
+  return said.length > 0 ? `exited with code ${code}: ${said.slice(0, 300)}` : `exited with code ${code}`;
+}
+
+/**
+ * The agent's own account of the failure, out of whatever it printed.
+ *
+ * Tolerant on purpose. This runs when something has already gone wrong, so the
+ * output may be a whole envelope, a stream of events with the envelope last, or
+ * not JSON at all, and a parse failure here must not replace the agent's
+ * message with one about parsing.
+ */
+function agentReportedError(stdout: string): string | undefined {
+  const text = stdout.trim();
+  if (text.length === 0) return undefined;
+
+  const lines = text.split('\n');
+  const envelope = parseObject(text) ?? parseObject(lines[lines.length - 1] ?? '');
+  if (!envelope) return undefined;
+
+  const message = ['result', 'error', 'message'].reduce<string | undefined>(
+    (found, key) => found ?? (typeof envelope[key] === 'string' ? (envelope[key] as string) : undefined),
+    undefined,
+  );
+
+  if (message === undefined) return undefined;
+
+  const status = envelope['api_error_status'];
+  return typeof status === 'number' ? `${status} ${message}` : message;
+}
+
+function parseObject(text: string): Record<string, unknown> | undefined {
+  try {
+    const value: unknown = JSON.parse(text);
+    return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export class RunnerError extends Error {
   constructor(
     readonly runnerId: string,

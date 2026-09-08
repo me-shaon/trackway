@@ -116,6 +116,13 @@ interface PartialMark {
    * succeeded, and re-reading from the third costs one pass and no duplicates.
    */
   coveredTo?: number;
+  /**
+   * Set when what failed was the agent itself rather than this session.
+   *
+   * The records that came back are still worth keeping, but there is no point
+   * starting the next session: it will fail in exactly the same way.
+   */
+  runnerGone?: string;
 }
 
 export function markPartial(
@@ -123,12 +130,14 @@ export function markPartial(
   failures: number,
   reasons: readonly string[] = [],
   coveredTo?: number,
+  runnerGone?: string,
 ): MemoryRecord[] {
   return Object.defineProperty(records, PARTIAL, {
     value: {
       count: failures,
       reasons: [...reasons],
       ...(coveredTo === undefined ? {} : { coveredTo }),
+      ...(runnerGone === undefined ? {} : { runnerGone }),
     } satisfies PartialMark,
     enumerable: false,
   }) as MemoryRecord[];
@@ -157,6 +166,36 @@ export function partialReasons(records: MemoryRecord[] | null): string[] {
 /** How far an interrupted session got, so the next sweep resumes rather than restarts. */
 export function partialCoveredTo(records: MemoryRecord[] | null): number | undefined {
   return partialMark(records)?.coveredTo;
+}
+
+/** Set when the agent gave out part way through, rather than this session being bad. */
+export function partialRunnerGone(records: MemoryRecord[] | null): string | undefined {
+  return partialMark(records)?.runnerGone;
+}
+
+/**
+ * Marks a failure as the agent being unusable rather than this session being bad.
+ *
+ * The sweep is deliberately ignorant of models and runners, so the distiller
+ * says which kind of failure this is rather than the sweep inferring it from an
+ * error type it should not have to know about.
+ *
+ * The distinction is the whole difference between a bad minute and lost work. A
+ * spent usage limit fails every session it is asked about, and each of those
+ * counted as that session failing: one user watched 700 of 802 sessions report
+ * the same failure, and three syncs of that would have put every one of them
+ * over the limit that takes a session out of all future sweeps.
+ */
+export const RUNNER_GONE = Symbol.for('trackway.runnerGone');
+
+export function markRunnerGone<E extends object>(error: E, reason: string): E {
+  return Object.defineProperty(error, RUNNER_GONE, { value: reason, enumerable: false });
+}
+
+export function runnerGoneReason(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+  const value = (error as Record<symbol, unknown>)[RUNNER_GONE];
+  return typeof value === 'string' ? value : undefined;
 }
 
 /**
@@ -231,6 +270,13 @@ export interface SweepResult {
   failures: SweepFailure[];
   /** Sessions eligible but not reached because the per-run cap was hit. */
   deferred: number;
+  /**
+   * Why the sweep gave up part way, when it did.
+   *
+   * Not a session failing. The agent this machine distils with became unusable,
+   * so everything left is for a later run rather than for this one.
+   */
+  stopped?: string;
 }
 
 /**
@@ -460,6 +506,19 @@ export async function runSweep(
       }
 
       await checkpoint();
+
+      const gone = partialRunnerGone(records);
+      if (gone !== undefined) {
+        // The agent gave out half way through this session. Nothing here was
+        // wrong, so nothing is counted against it, and the rest of the sweep
+        // would only ask an unusable agent the same question 700 more times.
+        const entry = state.sessions[key];
+        if (entry) entry.failureCount = previous?.failureCount ?? 0;
+        await checkpoint();
+        result.stopped = gone;
+        result.deferred += total - index;
+        break;
+      }
     } catch (error) {
       const reason = String(error instanceof Error ? error.message : error);
       result.failures.push({
@@ -468,6 +527,17 @@ export async function runSweep(
         reason,
       });
       report({ phase: 'done', ...where, records: 0, outcome: 'failed', reason });
+
+      const gone = runnerGoneReason(error);
+      if (gone !== undefined) {
+        // Reported once and left alone. The session is untouched in the state
+        // file, so it stays exactly as eligible as it was and the run that
+        // finds a working agent picks it up.
+        result.stopped = gone;
+        result.deferred += total - index;
+        break;
+      }
+
       recordFailure(state, key, descriptor, previous, now, error);
       await checkpoint();
     }

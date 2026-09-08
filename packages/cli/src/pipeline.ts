@@ -268,19 +268,24 @@ async function runSync(workspace: Workspace, options: SyncOptions): Promise<Sync
   // it, would otherwise stay ungrouped forever: their sessions are finished, so
   // no future sweep will look at them again. Catching up here is the same
   // self-heal every read command already does for distillation.
-  await isolate(
-    () =>
-      catchUpGrouping(workspace, metered, callBudget, {
-        maxSessions: options.maxSessions ?? CATCH_UP_SESSIONS,
-        onProblem,
-        ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
-      }),
-    undefined,
-    {
-      operation: 'organize',
-      logPath: join(workspace.cacheDir, 'failures.log'),
-    },
-  );
+  //
+  // Not when the sweep stopped because the agent is unusable: grouping is more
+  // model calls through the same runner, and they fail the same way.
+  if (sweep.stopped === undefined) {
+    await isolate(
+      () =>
+        catchUpGrouping(workspace, metered, callBudget, {
+          maxSessions: options.maxSessions ?? CATCH_UP_SESSIONS,
+          onProblem,
+          ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+        }),
+      undefined,
+      {
+        operation: 'organize',
+        logPath: join(workspace.cacheDir, 'failures.log'),
+      },
+    );
+  }
 
   const purge = await purgeCache(
     workspace.cacheDir,

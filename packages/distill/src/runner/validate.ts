@@ -85,7 +85,67 @@ const RawSignificance = z
   .enum(['business', 'technical', 'direction', 'working'])
   .default('working');
 
-export const RawDistillation = z.strictObject({
+export /**
+ * The words a model reaches for, mapped to the three the schema knows.
+ *
+ * The label is not content: the outcome's text says what happened, and this
+ * says only which way it went. A model writes it in whatever word fits the
+ * sentence it just wrote, and a batch was being rejected whole over the
+ * difference between "success" and "passed". One real sync reported
+ * `outcomes.2.result: Invalid input` on a session that kept 7 records and lost
+ * the rest of that region, then paid to read it again on the next sweep.
+ *
+ * The empty string was already tolerated here for that reason. This is the same
+ * concession to the same field, and it can only ever record what the model
+ * meant rather than something it did not say.
+ */
+const RESULT_WORDS: Readonly<Record<string, 'passed' | 'failed' | 'unresolved'>> = {
+  '': 'unresolved',
+  success: 'passed',
+  successful: 'passed',
+  succeeded: 'passed',
+  pass: 'passed',
+  passing: 'passed',
+  fixed: 'passed',
+  resolved: 'passed',
+  done: 'passed',
+  complete: 'passed',
+  completed: 'passed',
+  working: 'passed',
+  fail: 'failed',
+  failing: 'failed',
+  failure: 'failed',
+  error: 'failed',
+  errored: 'failed',
+  broken: 'failed',
+  regressed: 'failed',
+  partial: 'unresolved',
+  pending: 'unresolved',
+  open: 'unresolved',
+  ongoing: 'unresolved',
+  unknown: 'unresolved',
+  inconclusive: 'unresolved',
+  unclear: 'unresolved',
+};
+
+/**
+ * A word that means one of the three, or nothing.
+ *
+ * Anything unrecognised still rejects the batch. A label nobody can read is the
+ * model getting the shape wrong rather than wording it differently, and that is
+ * the case this file refuses on purpose.
+ */
+const OutcomeResult = z
+  .string()
+  .transform((value) => {
+    // Own keys only. An inherited one would answer for "constructor" and hand
+    // the enum a function to reject, which is a confusing way to say no.
+    const word = value.trim().toLowerCase();
+    return Object.hasOwn(RESULT_WORDS, word) ? (RESULT_WORDS[word] as string) : value;
+  })
+  .pipe(z.enum(['passed', 'failed', 'unresolved']));
+
+const RawDistillation = z.strictObject({
   questions: z
     .array(
       z.strictObject({
@@ -127,14 +187,7 @@ export const RawDistillation = z.strictObject({
       z.strictObject({
         significance: RawSignificance,
         text: z.string().min(1),
-        /**
-         * Models return an empty string here often enough that rejecting the
-         * batch over it would throw away good records for a field that is a
-         * label rather than content.
-         */
-        result: z
-          .union([z.enum(['passed', 'failed', 'unresolved']), z.literal('')])
-          .transform((value) => (value === '' ? ('unresolved' as const) : value)),
+        result: OutcomeResult,
       }),
     )
     .default([]),

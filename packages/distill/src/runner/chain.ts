@@ -39,6 +39,12 @@ const DEAD: readonly RegExp[] = [
   /unauthor(ised|ized)/i,
   /not logged in|please log in|login required|authenticate/i,
   /quota|credit balance|billing/i,
+  // A spent limit lasts hours and a sweep lasts minutes, so within one run it
+  // is as permanent as a closed account. The agent has already retried it
+  // internally by the time it surfaces here. Reported as an ordinary exit, it
+  // cost one user three attempts per chunk on every one of 802 sessions.
+  /\b429\b/,
+  /usage limit|rate limit|too many requests/i,
 ];
 
 export function isFatal(error: unknown): boolean {

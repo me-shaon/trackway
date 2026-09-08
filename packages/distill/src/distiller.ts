@@ -3,9 +3,16 @@ import { DEFAULT_CHUNK_SIZE, DEFAULT_MAX_CHUNK_CHARS, chunkEvents } from './chun
 import { describeForksForPrompt, forkAlternatives, harvestForks, type HarvestedFork } from './harvest.js';
 import { collapseNearDuplicates } from './dedupe.js';
 import { buildPrompt, isOwnExtraction, renderedSize } from './prompts/extract.js';
+import { isFatal } from './runner/chain.js';
 import { RunnerError, type DistillRunner, type RunUsage } from './runner/contract.js';
 import { toRecords } from './runner/validate.js';
-import { markIncomplete, markPartial, markSkipped, type Distiller } from './sweep/run.js';
+import {
+  markIncomplete,
+  markPartial,
+  markRunnerGone,
+  markSkipped,
+  type Distiller,
+} from './sweep/run.js';
 
 export interface DistillerOptions {
   runner: DistillRunner;
@@ -59,8 +66,13 @@ const RETRY_BACKOFF_MS = 2_000;
  */
 const TRANSIENT: ReadonlySet<string> = new Set(['timeout', 'exit', 'output']);
 
+/**
+ * A fatal failure is an exit like any other to look at, and nothing like one to
+ * act on. By the time the chain hands one back it has already struck every
+ * runner off, so the three attempts spent asking again all get the same answer.
+ */
 function isWorthRetrying(error: unknown): boolean {
-  return error instanceof RunnerError && TRANSIENT.has(error.kind);
+  return error instanceof RunnerError && TRANSIENT.has(error.kind) && !isFatal(error);
 }
 
 const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -355,6 +367,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
       }
     }
 
+    // An account that is out of usage, or a machine with no agent on it, fails
+    // the next session exactly as it failed this one. Saying which kind of
+    // failure this was lets the sweep stop instead of proving it 700 more times.
+    const gone = failures.find((failure) => isFatal(failure));
+
     if (records.length === 0 && harvested.length === 0 && failures.length > 0) {
       // Rethrow the original rather than wrapping it. The sweep distinguishes a
       // runner failure from invalid output, and a wrapper would erase that.
@@ -364,6 +381,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       // reason to discard them. Throwing here meant `trackway ingest` returned
       // nothing at all on a machine with no agent installed, when everything
       // the transcript recorded literally was already in hand.
+      if (gone instanceof Error) throw markRunnerGone(gone, describeFailure(gone));
       throw failures[0];
     }
 
@@ -379,7 +397,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // Some chunks failed and others did not. Say so, so the sweep can keep
     // these records without treating the session as fully read.
     if (failures.length > 0) {
-      return markPartial(distilled, failures.length, failures.map(describeFailure), coveredTo);
+      return markPartial(
+        distilled,
+        failures.length,
+        failures.map(describeFailure),
+        coveredTo,
+        gone === undefined ? undefined : describeFailure(gone),
+      );
     }
 
     // Stopped on purpose rather than in trouble. The sweep advances the

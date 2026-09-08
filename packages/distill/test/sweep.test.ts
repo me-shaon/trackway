@@ -11,6 +11,7 @@ import {
   loadState,
   purgeCache,
   markPartial,
+  markRunnerGone,
   partialFailures,
   partialReasons,
   runSweep,
@@ -309,6 +310,54 @@ describe('running a sweep', () => {
       'disc-ses-1-3',
     ]);
     expect(adapter.readSessionCalls.at(-1)?.fromOffset).toBe(1);
+  });
+
+  /*
+   * An exhausted account fails the next session exactly as it failed this one.
+   * Left to run, a sweep of 802 sessions printed 700 identical failures, and
+   * three syncs of that put every session over the failure limit and struck it
+   * off for good. Nothing was wrong with any of them.
+   */
+  it('stops when the runner is gone rather than failing every session with it', async () => {
+    const events = new Map([
+      ['ses-1', [eventAt(0, 'ses-1')]],
+      ['ses-2', [eventAt(0, 'ses-2')]],
+    ]);
+    const adapter = new FakeAdapter('fake', [descriptor(), descriptor({ sessionId: 'ses-2' })], events);
+    const registry = new AdapterRegistry([adapter]);
+
+    let asked = 0;
+    const distill: Distiller = async () => {
+      asked += 1;
+      throw markRunnerGone(new Error('claude-code: 429 usage limit reached'), 'claude-code: 429 usage limit reached');
+    };
+
+    const result = await runSweep(registry, distill, { cacheDir, quietWindowMinutes: 15, now: NOW });
+
+    expect(asked).toBe(1);
+    expect(result.stopped).toContain('usage limit');
+    expect(result.deferred).toBe(1);
+    expect(result.failures).toHaveLength(1);
+  });
+
+  it('holds nothing against a session the runner never got to', async () => {
+    const events = new Map([['ses-1', [eventAt(0)]]]);
+    const adapter = new FakeAdapter('fake', [descriptor()], events);
+    const registry = new AdapterRegistry([adapter]);
+    const distill: Distiller = async () => {
+      throw markRunnerGone(new Error('claude-code: 429 usage limit reached'), 'claude-code is out of usage');
+    };
+
+    const options = { cacheDir, quietWindowMinutes: 15, now: NOW };
+    await runSweep(registry, distill, options);
+    await runSweep(registry, distill, options);
+    await runSweep(registry, distill, options);
+
+    const state = await loadState(cacheDir);
+
+    // Three strikes takes a session out of every future sweep. A runner that
+    // was never there must not count as one.
+    expect(state.sessions[stateKey('fake', 'ses-1')]?.failureCount ?? 0).toBe(0);
   });
 
   // Covers AE7.
