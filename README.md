@@ -107,7 +107,7 @@ git clone https://github.com/me-shaon/trackway.git
 cd trackway
 npm install
 npm run build
-npm link            # puts `trackway` on your PATH
+npm link -w trackway   # puts `trackway` on your PATH
 ```
 
 `init` writes the config, sets up ignore rules, and offers to install a hook so records accumulate while you work. The hook installs once per machine and covers every repository, including ones you create later.
