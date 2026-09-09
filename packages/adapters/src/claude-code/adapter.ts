@@ -17,6 +17,34 @@ import { parseEntries } from './parse.js';
 
 const ADAPTER_ID = 'claude-code';
 
+/**
+ * Where Claude Code keeps its sessions on this machine.
+ *
+ * Resolved from `CLAUDE_CONFIG_DIR`, which is how Claude Code itself is pointed
+ * at a config tree, so a second instance is swept without being configured
+ * here as well. Reading it also covers the hook: a sweep triggered from inside
+ * a relocated instance inherits the variable and reads that instance's own
+ * sessions rather than the default tree.
+ *
+ * The environment arrives as an argument so a test can supply one instead of
+ * mutating the process it runs in.
+ */
+export function claudeProjectsDir(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.CLAUDE_CONFIG_DIR?.trim();
+  const base = configured ? expandTilde(configured) : join(homedir(), '.claude');
+  return join(base, 'projects');
+}
+
+/**
+ * A tilde survives into the value only when nothing expanded it, which happens
+ * whenever the variable is quoted or set somewhere no shell is involved.
+ * Expanding it is cheaper than reporting a missing directory named `~`.
+ */
+function expandTilde(path: string): string {
+  if (path === '~') return homedir();
+  return path.startsWith('~/') ? join(homedir(), path.slice(2)) : path;
+}
+
 export interface ClaudeCodeOptions {
   /** Overridable so tests can point at a fixture tree. */
   projectsDir?: string;
@@ -44,7 +72,7 @@ export class ClaudeCodeAdapter implements SessionAdapter {
   private readonly projectsDir: string;
 
   constructor(options: ClaudeCodeOptions = {}) {
-    this.projectsDir = options.projectsDir ?? join(homedir(), '.claude', 'projects');
+    this.projectsDir = options.projectsDir ?? claudeProjectsDir();
   }
 
   async isAvailable(): Promise<AdapterAvailability> {
