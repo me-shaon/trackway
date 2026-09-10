@@ -107,8 +107,10 @@ git clone https://github.com/me-shaon/trackway.git
 cd trackway
 npm install
 npm run build
-npm link            # puts `trackway` on your PATH
+npm link -w trackway   # puts `trackway` on your PATH
 ```
+
+The `-w` matters. The repository root is a private workspace container with no `bin` of its own, so a bare `npm link` links the root and exits 0 without putting anything on your PATH.
 
 `init` writes the config, sets up ignore rules, and offers to install a hook so records accumulate while you work. The hook installs once per machine and covers every repository, including ones you create later.
 
