@@ -106,6 +106,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   process.chdir(previousCwd);
+  vi.unstubAllEnvs();
   await rm(repo, { recursive: true, force: true });
 });
 
@@ -208,11 +209,22 @@ describe('ignore rules', () => {
 
 describe('hook installation', () => {
   it('writes a hook into user-level settings, not the repository', () => {
+    vi.stubEnv('CLAUDE_CONFIG_DIR', undefined);
     const [target] = hookTargets('/home/dev');
 
     // User level is the point: one install covers every repository, including
     // ones that do not exist yet.
     expect(target?.settingsPath).toBe('/home/dev/.claude/settings.json');
+  });
+
+  it('follows CLAUDE_CONFIG_DIR to the instance that is running', () => {
+    // The hook fires inside a session that already exports this, so a
+    // relocated instance installs into its own settings without being told.
+    vi.stubEnv('CLAUDE_CONFIG_DIR', '/home/dev/.claude-personal');
+
+    const [target] = hookTargets('/home/dev');
+
+    expect(target?.settingsPath).toBe('/home/dev/.claude-personal/settings.json');
   });
 
   it('installs into a settings file that does not exist yet', async () => {
@@ -522,6 +534,17 @@ describe('when the index and the files disagree', () => {
     await statusCommand({}, io);
 
     expect(io.lines.join('\n')).toContain('trackway rebuild');
+  });
+
+  it('names the session directory each agent read', async () => {
+    // "claude-code ready" looked identical whether the tree held 300 sessions
+    // or was the wrong tree entirely.
+    vi.stubEnv('CLAUDE_CONFIG_DIR', '/home/dev/.claude-personal');
+
+    const io = captureIo();
+    await statusCommand({}, io);
+
+    expect(io.lines.join('\n')).toContain('/home/dev/.claude-personal/projects');
   });
 
   it('says nothing when the index matches the files', async () => {

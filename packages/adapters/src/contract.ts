@@ -23,6 +23,11 @@ export interface AdapterAvailability {
   available: boolean;
   /** Why not, when unavailable. Surfaced by `trackway status`. */
   reason?: string;
+  /**
+   * Where the adapter looked. Surfaced by `trackway status` so an empty result
+   * can be told apart from a sweep of the wrong directory.
+   */
+  source?: string;
 }
 
 /**

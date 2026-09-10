@@ -215,7 +215,9 @@ Claude Code's directory follows `CLAUDE_CONFIG_DIR`, the variable `claude` itsel
 CLAUDE_CONFIG_DIR=~/.claude-personal trackway sync
 ```
 
-A sweep the hook triggers inside that instance inherits the variable and reads that instance's own sessions. Unset, the directory is `~/.claude`.
+A sweep the hook triggers inside that instance inherits the variable and reads that instance's own sessions, and `trackway init` run there installs its hook into that instance's settings. Unset, the directory is `~/.claude`.
+
+`trackway status` prints the directory or database each agent was read from, so a sweep that finds nothing tells you where it looked.
 
 OpenCode was meant to go through `opencode export --sanitize`, which returns already-redacted JSON. That path does not work non-interactively: `opencode session list` writes nothing when stdout is not a terminal, so sessions cannot be enumerated. Reading the database directly needs no binary and no terminal.
 

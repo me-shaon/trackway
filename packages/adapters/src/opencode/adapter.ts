@@ -71,7 +71,11 @@ export class OpenCodeAdapter implements SessionAdapter {
     try {
       await stat(this.databasePath);
     } catch {
-      return { available: false, reason: 'no OpenCode database found' };
+      return {
+        available: false,
+        reason: `no OpenCode database at ${this.databasePath}`,
+        source: this.databasePath,
+      };
     }
 
     try {
@@ -94,7 +98,7 @@ export class OpenCodeAdapter implements SessionAdapter {
       return { available: false, reason: `OpenCode database unreadable: ${String(error)}` };
     }
 
-    return { available: true };
+    return { available: true, source: this.databasePath };
   }
 
   async listSessions(options: ListOptions = {}): Promise<SessionDescriptor[]> {

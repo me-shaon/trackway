@@ -242,16 +242,23 @@ describe('subagent and meta traffic', () => {
 
 describe('availability', () => {
   it('reports unavailable when there is no session directory', async () => {
-    const adapter = adapterOver(join(scratch, 'nothing-here'));
+    const missing = join(scratch, 'nothing-here');
+    const adapter = adapterOver(missing);
 
     const availability = await adapter.isAvailable();
 
     expect(availability.available).toBe(false);
     expect(availability.reason).toContain('no Claude Code session directory');
+    // Naming the directory is the difference between "no sessions yet" and
+    // "looking in the wrong tree", which otherwise read identically.
+    expect(availability.reason).toContain(missing);
   });
 
-  it('reports available when the directory exists', async () => {
-    expect(await adapterOver(FIXTURES).isAvailable()).toEqual({ available: true });
+  it('reports available when the directory exists, and says which one', async () => {
+    expect(await adapterOver(FIXTURES).isAvailable()).toEqual({
+      available: true,
+      source: FIXTURES,
+    });
   });
 
   it('filters sessions to the repository they ran in', async () => {
@@ -340,6 +347,15 @@ describe('locating the session directory', () => {
     const sessions = await new ClaudeCodeAdapter().listSessions();
 
     expect(sessions).toHaveLength(1);
+  });
+
+  /** A fixture tree is asked for explicitly, so the environment cannot move it. */
+  it('lets an explicit projectsDir win over the environment', async () => {
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(scratch, 'claude-elsewhere'));
+
+    const availability = await adapterOver(FIXTURES).isAvailable();
+
+    expect(availability.source).toBe(FIXTURES);
   });
 
   /** The variable is how most machines are set up: unset. */
