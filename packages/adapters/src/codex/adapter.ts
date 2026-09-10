@@ -63,11 +63,19 @@ export class CodexAdapter implements SessionAdapter {
     try {
       const info = await stat(this.sessionsDir);
       if (!info.isDirectory()) {
-        return { available: false, reason: `${this.sessionsDir} is not a directory` };
+        return {
+          available: false,
+          reason: `${this.sessionsDir} is not a directory`,
+          source: this.sessionsDir,
+        };
       }
-      return { available: true };
+      return { available: true, source: this.sessionsDir };
     } catch {
-      return { available: false, reason: 'no Codex session directory found' };
+      return {
+        available: false,
+        reason: `no Codex session directory at ${this.sessionsDir}`,
+        source: this.sessionsDir,
+      };
     }
   }
 

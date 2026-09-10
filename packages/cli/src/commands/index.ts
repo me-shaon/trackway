@@ -513,7 +513,10 @@ export async function statusCommand(_options: unknown, io: Io = consoleIo): Prom
         ? 'ready'
         : 'ingest only'
       : `unavailable: ${status.reason ?? 'unknown'}`;
-    io.out(`  ${status.id.padEnd(12)} ${state}`);
+    // The directory, because `ready` alone reads the same whether the tree
+    // holds every session on the machine or is the wrong tree entirely.
+    const where = status.available && status.source ? `  ${status.source}` : '';
+    io.out(`  ${status.id.padEnd(12)} ${state}${where}`);
   }
 
   // An adapter being present says a session can be read. It says nothing about

@@ -5,6 +5,8 @@ export interface AdapterStatus {
   id: string;
   available: boolean;
   reason?: string;
+  /** The directory or database the adapter reads, when it has one to report. */
+  source?: string;
   canDistill: boolean;
 }
 
@@ -57,6 +59,7 @@ export class AdapterRegistry {
           id: adapter.id,
           available: availability.available,
           ...(availability.reason === undefined ? {} : { reason: availability.reason }),
+          ...(availability.source === undefined ? {} : { source: availability.source }),
           canDistill: adapter.capabilities.canDistill,
         };
       }),

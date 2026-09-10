@@ -1,6 +1,7 @@
 import { chmod, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { claudeConfigDir } from '@trackway/adapters';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -21,7 +22,10 @@ export interface HookTarget {
  * have to be installed again for each repo and would miss new ones entirely.
  */
 export function hookTargets(home: string = homedir()): HookTarget[] {
-  return [{ agent: 'claude-code', settingsPath: join(home, '.claude', 'settings.json') }];
+  // Resolved the way the agent resolves it, so an instance relocated with
+  // CLAUDE_CONFIG_DIR gets its hook in the settings file it actually reads.
+  const configDir = claudeConfigDir(process.env, home);
+  return [{ agent: 'claude-code', settingsPath: join(configDir, 'settings.json') }];
 }
 
 export interface HookInstallResult {
