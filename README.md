@@ -209,6 +209,14 @@ Credential redaction is best effort. A secret shaped like ordinary prose will ge
 | Codex | rollout files in `~/.codex/sessions/` | yes | yes |
 | OpenCode | its local SQLite database, read-only | yes | yes |
 
+Claude Code's directory follows `CLAUDE_CONFIG_DIR`, the variable `claude` itself reads, so an instance kept under its own config tree needs nothing configured here:
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-personal trackway sync
+```
+
+A sweep the hook triggers inside that instance inherits the variable and reads that instance's own sessions. Unset, the directory is `~/.claude`.
+
 OpenCode was meant to go through `opencode export --sanitize`, which returns already-redacted JSON. That path does not work non-interactively: `opencode session list` writes nothing when stdout is not a terminal, so sessions cannot be enumerated. Reading the database directly needs no binary and no terminal.
 
 **Cursor has no adapter yet.** Its chat history is an undocumented SQLite database and there was no installation to verify a parser against. Guessing at a schema is how the Codex adapter shipped disabled for the wrong reason.

@@ -1,11 +1,12 @@
 import { MemoryEvent as MemoryEventSchema } from '@trackway/core';
 import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ClaudeCodeAdapter,
+  claudeProjectsDir,
   UnknownFormatError,
   containsReasoning,
   detectFormat,
@@ -31,6 +32,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rm(scratch, { recursive: true, force: true });
+  vi.unstubAllEnvs();
 });
 
 function adapterOver(projectsDir: string) {
@@ -312,5 +314,57 @@ describe('behaviour discovered against the real session corpus', () => {
     expect(serialized).not.toContain('A'.repeat(1000));
     expect(serialized).toContain('"omitted":true');
     expect(serialized).toContain('look at this');
+  });
+});
+
+describe('locating the session directory', () => {
+  /** A config tree of the shape Claude Code writes, holding one real session. */
+  async function configDirHoldingASession(name: string): Promise<string> {
+    const config = join(scratch, name);
+    const project = join(config, 'projects', '-fixture-repo');
+    await mkdir(project, { recursive: true });
+    await writeFile(join(project, 'session.jsonl'), await readFile(FIXTURE_SESSION, 'utf8'));
+    return config;
+  }
+
+  /**
+   * A second Claude Code instance keeps its history under its own config
+   * directory, and `claude` is told which one by CLAUDE_CONFIG_DIR. Reading the
+   * same variable is what lets a sweep reach that instance without being
+   * configured separately, and without it those sessions are invisible.
+   */
+  it('reads sessions from the config directory CLAUDE_CONFIG_DIR names', async () => {
+    const config = await configDirHoldingASession('claude-elsewhere');
+    vi.stubEnv('CLAUDE_CONFIG_DIR', config);
+
+    const sessions = await new ClaudeCodeAdapter().listSessions();
+
+    expect(sessions).toHaveLength(1);
+  });
+
+  /** The variable is how most machines are set up: unset. */
+  it('falls back to the default tree when CLAUDE_CONFIG_DIR is not set', () => {
+    expect(claudeProjectsDir({})).toBe(join(homedir(), '.claude', 'projects'));
+  });
+
+  /**
+   * An exported-but-empty variable is a normal state of a shell profile, and
+   * joining it would look in `/projects` at the root of the filesystem.
+   */
+  it('ignores a value that is only whitespace', () => {
+    expect(claudeProjectsDir({ CLAUDE_CONFIG_DIR: '   ' })).toBe(
+      join(homedir(), '.claude', 'projects'),
+    );
+  });
+
+  /**
+   * A tilde only survives into the value when it was quoted, which is easy to
+   * do in a settings file where no shell is involved. Expanding it here is
+   * cheaper than reporting a missing directory whose name contains a `~`.
+   */
+  it('expands a leading tilde', () => {
+    expect(claudeProjectsDir({ CLAUDE_CONFIG_DIR: '~/.claude-personal' })).toBe(
+      join(homedir(), '.claude-personal', 'projects'),
+    );
   });
 });
